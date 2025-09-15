@@ -1,44 +1,59 @@
 {
-  "name": "gh-bot",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-02-11",
-  "compatibility_flags": ["nodejs_compat"],
-  "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1
-  },
-  "ai": {
-    "binding": "AI"
-  },
-  "durable_objects": {
-    "bindings": [
-      { "name": "RESEARCH_ORCH", "class_name": "ResearchOrchestrator" },
-      { "name": "PR_WORKFLOWS", "class_name": "PrWorkflow" },
-      { "name": "PROFILE_SCANNER", "class_name": "ProfileScanner" }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_classes": ["ResearchOrchestrator", "PrWorkflow", "ProfileScanner"]
-    }
-  ],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "gh-bot",
-      "database_id": "d6674b48-3b20-422f-b9eb-65f42f26a44e"
-    }
-  ],
-  "kv_namespaces": [
-    {
-      "binding": "USER_PREFERENCES",
-      "id": "user_preferences_kv",
-      "preview_id": "user_preferences_kv_preview"
-    }
-  ],
-  "vars": {
-    "REQUIRED_LABEL": "auto-commit-ok",
-    "SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b"
-  }
+	"name": "gh-bot",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-02-11",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"ai": {
+		"binding": "AI"
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "RESEARCH_ORCH",
+				"class_name": "ResearchOrchestrator"
+			},
+			{
+				"name": "PR_WORKFLOWS",
+				"class_name": "PrWorkflow"
+			},
+			{
+				"name": "PROFILE_SCANNER",
+				"class_name": "ProfileScanner"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": [
+				"ResearchOrchestrator",
+				"PrWorkflow",
+				"ProfileScanner"
+			]
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "gh-bot",
+			"database_id": "d6674b48-3b20-422f-b9eb-65f42f26a44e"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "USER_PREFERENCES",
+			"id": "0b559703c0ff499c87dabbeaeac932c5",
+			"preview_id": "7fc6108f01184967aeaf2109da0549de"
+		}
+	],
+	"vars": {
+		"REQUIRED_LABEL": "auto-commit-ok",
+		"SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b"
+	}
 }
