@@ -133,7 +133,7 @@ app.get("/ws", (c: HonoContext) => {
                 return new Response("Expected WebSocket", { status: 400 });
         }
         const pair = new WebSocketPair();
-        const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+        const { 0: client, 1: server } = pair;
         server.accept();
         server.addEventListener("message", (event) => {
                 server.send(event.data);
