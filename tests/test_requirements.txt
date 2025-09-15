@@ -1,0 +1,2 @@
+# Requirements for gh-bot Worker testing script
+requests>=2.31.0

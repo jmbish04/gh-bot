@@ -1,0 +1,3651 @@
+/// <reference types="@cloudflare/workers-types" />
+/**
+ * GH Bot Worker — Orchestrator & API
+ * -----------------------------------
+ * PURPOSE
+ * - Receives GitHub webhooks (PR reviews, comments, labels, etc.) and serializes PR work via a Durable Object.
+ * - Discovers & indexes repos from your GitHub App installation(s).
+ * - Runs AI-assisted repository analysis (light summary + deep structured analysis) and stores results in D1.
+ * - Exposes HTTP endpoints for health, streaming demo, research orchestration, status, results, and manual analyses.
+ *
+ * ARCHITECTURE (high-level)
+ * - Hono app (this file) wires routes to:
+ * • Webhook router: POST /github/webhook  → forwards to PR Durable Object (PR_WORKFLOWS).
+ * • Research DO: POST /research/run, GET /research/status → fan-out repo search & AI summarization.
+ * • Query endpoints: GET /research/results, /research/analysis, /research/structured, /research/risks.
+ * • Manual triggers: POST /research/analyze, /research/analyze-structured.
+ * - Durable Objects:
+ * • ResearchOrchestrator: searches repos, dedupes, ranks, enqueues profiles, runs summarizers.
+ * • PrWorkflow: serializes per-PR actions (apply suggestions, summarize, etc.).
+ * • ProfileScanner: crawls developer profiles/orgs and summarizes.
+ * - D1 Database:
+ * • tables: projects, repo_analysis, repo_analysis_bindings, gh_events, etc. (see migrations).
+ *
+ * SECURITY
+ * - Webhook signature is verified (HMAC SHA256) using GITHUB_WEBHOOK_SECRET.
+ * - GitHub API calls use installation tokens minted from GITHUB_APP_ID + GITHUB_PRIVATE_KEY.
+ * - Never echo secrets; prefer ctx.waitUntil for background tasks.
+ *
+ * PERFORMANCE/RELIABILITY
+ * - Use Durable Objects for single-flight per-PR/per-owner/per-research-run.
+ * - Bulk checks & UPSERTs to avoid N+1 round trips.
+ * - Time-bound AI prompts and cap sampled bytes.
+ *
+ * AI USAGE
+ * - Summaries can use env.AI.run() if AI binding is present; otherwise fallback to REST.
+ * - Prompts require ENGLISH-ONLY outputs and structured JSON for machine-readability.
+ *
+ * ROUTE QUICK REFERENCE
+ * GET  /health                       -> { ok: true }
+ * GET  /demo/stream                  -> simple server-sent stream demo (dev utility)
+ * POST /github/webhook               -> verify sig; route PR events to PR DO
+ * POST /research/run                 -> kick off research sweep via ResearchOrchestrator DO
+ * GET  /research/status              -> status of last research run
+ * GET  /research/results             -> top repos (score + AI summaries)
+ * GET  /research/analysis?repo=...   -> raw analysis row for a repo
+ * GET  /research/risks               -> repos with flagged risks
+ * POST /research/analyze             -> on-demand lightweight analysis
+ * GET  /research/structured          -> filterable structured analysis (kind/binding/confidence)
+ * POST /research/analyze-structured  -> on-demand structured analysis
+ */
+
+import { type Context, Hono } from "hono";
+// Durable Objects
+import { PrWorkflow } from "./do_pr_workflows";
+import { ProfileScanner } from "./do_profile_scanner";
+import { ResearchOrchestrator } from "./do_research";
+// Import new Colby service modules
+import { generateAgentAssets } from "./modules/agent_generator";
+import { summarizeRepo } from "./modules/ai";
+import { detectRepoBadges } from "./modules/badge_detector";
+import { insertRepoIfNew, markRepoSynced } from "./modules/db";
+import {
+    getInstallationToken,
+    listInstallations,
+    listReposForInstallation,
+} from "./modules/github";
+import { generateInfrastructureGuidance } from "./modules/infra_guidance";
+import { fetchRelevantLLMContent } from "./modules/llm_fetcher";
+import {
+    analyzeRepoCode,
+    analyzeRepoCodeStructured,
+} from "./modules/repo_analyzer";
+import { AIRepoAnalyzer } from "./modules/ai_repo_analyzer";
+import { UserPreferencesManager } from "./modules/user_preferences";
+import { handleWebhook } from "./routes/webhook";
+import { asyncGeneratorToStream } from "./stream";
+
+/**
+ * Runtime bindings available to this Worker.
+ * NOTE: Add the corresponding sections in wrangler.toml:
+ * - D1 binding: [[d1_databases]] binding = "DB"
+ * - Durable Objects: [durable_objects] bindings = [...]
+ * - (Optional) AI binding: [ai] binding = "AI"
+ * - (Optional) R2 binding: [[r2_buckets]] binding = "R2"
+ */
+type Env = {
+	DB: D1Database;
+	GITHUB_APP_ID: string;
+	GITHUB_PRIVATE_KEY: string;
+	GITHUB_WEBHOOK_SECRET: string;
+	CF_ACCOUNT_ID: string;
+	CF_API_TOKEN: string;
+	SUMMARY_CF_MODEL: string;
+	FRONTEND_AUTH_PASSWORD: string;
+	RESEARCH_ORCH?: DurableObjectNamespace;
+	PR_WORKFLOWS: DurableObjectNamespace;
+	PROFILE_SCANNER: DurableObjectNamespace; // Matches wrangler.toml binding name
+	ASSETS: Fetcher; // Static assets binding
+	AI: any; // Workers AI binding
+	USER_PREFERENCES: KVNamespace; // User preferences KV storage
+};
+
+type HonoContext = Context<{ Bindings: Env }>;
+
+const app = new Hono<{ Bindings: Env }>();
+
+/**
+ * GET /health
+ * Lightweight liveness probe for uptime checks & CI smoke tests.
+ * Returns 200 with { ok: true } if the worker is reachable.
+ */
+app.get("/health", (c: HonoContext) => c.json({ ok: true }));
+
+/**
+ * GET /demo/stream
+ * Example of streaming a Server-Sent Event-like response from an async generator.
+ * Useful to verify your streaming utilities (see ./stream) behave as expected.
+ * NOT used by webhook/PR flows; safe to remove in production.
+ */
+app.get("/demo/stream", (_c: HonoContext) => {
+	async function* run() {
+		yield "starting…";
+		await new Promise((r) => setTimeout(r, 300));
+		yield "working…";
+		await new Promise((r) => setTimeout(r, 300));
+		yield "done.";
+	}
+	return new Response(asyncGeneratorToStream(run()), {
+		headers: { "Content-Type": "text/event-stream" },
+	});
+});
+
+/**
+ * POST /github/webhook
+ * GitHub → Worker entrypoint. Verifies HMAC signature, parses payload type,
+ * and forwards the event to the PR Durable Object (PR_WORKFLOWS).
+ *
+ * WHY a Durable Object?
+ * - Guarantees serialized processing per PR (no race conditions between comments/reviews).
+ * - Centralizes commit creation, AI actions, and retries.
+ *
+ * Implementation detail:
+ * - Full router/verification logic is encapsulated in routes/webhook.ts (handleWebhook).
+ * - Keep this thin to simplify testing and future route changes.
+ */
+/**
+ * POST /manual/trigger-llms-docs
+ * Manual trigger for LLMs documentation creation for a specific repository
+ */
+app.post("/manual/trigger-llms-docs", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json();
+		const repo = body.repo;
+		const installationId = body.installationId;
+
+		if (!repo) {
+			return c.json({ error: "repo parameter required" }, 400);
+		}
+
+		// First try to look up the repository in the database
+		let repoData = await c.env.DB.prepare(
+			'SELECT installation_id FROM repos WHERE full_name = ?'
+		).bind(repo).first();
+
+		let finalInstallationId: number;
+
+		if (!repoData) {
+			// Repository not in database, try to use provided installationId or default
+			if (installationId) {
+				finalInstallationId = installationId;
+				console.log(`[MANUAL] Using provided installation ID ${installationId} for ${repo}`);
+			} else {
+				// Try to get the first available installation (assuming org-wide access)
+				const installations = await c.env.DB.prepare(
+					'SELECT installation_id FROM repos LIMIT 1'
+				).first();
+
+				if (installations) {
+					finalInstallationId = installations.installation_id as number;
+					console.log(`[MANUAL] Using fallback installation ID ${finalInstallationId} for ${repo}`);
+				} else {
+					return c.json({
+						success: false,
+						message: `Repository ${repo} not found in database and no installations available. Please provide installationId or ensure repository sync has run.`
+					}, 404);
+				}
+			}
+		} else {
+			finalInstallationId = repoData.installation_id as number;
+		}
+
+		// Create synthetic event for LLMs docs creation
+		const syntheticEvent = {
+			kind: 'manual_trigger',
+			delivery: `manual-${Date.now()}`,
+			repo: repo,
+			author: 'manual-trigger',
+			installationId: finalInstallationId
+		};
+
+		// Get the PR_WORKFLOWS durable object
+		const doId = c.env.PR_WORKFLOWS.idFromName(`repo-${repo}`);
+		const stub = c.env.PR_WORKFLOWS.get(doId);
+
+		// Trigger LLMs documentation creation
+		const res = await stub.fetch('https://do/create-llms-docs', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(syntheticEvent)
+		});
+
+		if (res.ok) {
+			return c.json({
+				success: true,
+				message: `LLMs documentation creation triggered for ${repo} (using installation ID: ${finalInstallationId})`,
+				status: res.status
+			});
+		} else {
+			const errorText = await res.text();
+			return c.json({
+				success: false,
+				message: `Failed to trigger LLMs docs: ${errorText}`,
+				status: res.status
+			}, 500);
+		}
+	} catch (error: any) {
+		console.error('[MANUAL] Error triggering LLMs docs:', error);
+		return c.json({
+			success: false,
+			message: `Error: ${error instanceof Error ? error.message : String(error)}`
+		}, 500);
+	}
+});
+
+/**
+ * POST /manual/setup-github-key
+ * Set up the GitHub App private key in system configuration
+ */
+app.post("/manual/setup-github-key", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json();
+		const { privateKey, appId } = body;
+
+		if (!privateKey) {
+			return c.json({ error: "privateKey parameter required" }, 400);
+		}
+
+		if (!appId) {
+			return c.json({ error: "appId parameter required" }, 400);
+		}
+
+		// Check if we already have GitHub App credentials configured
+		const existingKey = await c.env.DB.prepare(
+			'SELECT value FROM system_config WHERE key = ?'
+		).bind('github_app_private_key').first();
+
+		const existingAppId = await c.env.DB.prepare(
+			'SELECT value FROM system_config WHERE key = ?'
+		).bind('github_app_id').first();
+
+		let message = "GitHub App configuration updated successfully";
+
+		if (existingKey && existingAppId) {
+			message = "GitHub App configuration updated (replaced existing credentials)";
+		} else if (existingKey || existingAppId) {
+			message = "GitHub App configuration completed (some credentials were missing)";
+		} else {
+			message = "GitHub App configuration set up successfully";
+		}
+
+		// Store the GitHub App private key
+		await c.env.DB.prepare(
+			'INSERT OR REPLACE INTO system_config (key, value, description, updated_at) VALUES (?, ?, ?, ?)'
+		).bind(
+			'github_app_private_key',
+			privateKey,
+			'GitHub App private key for token generation (supports multiple organizations)',
+			Date.now()
+		).run();
+
+		// Store the GitHub App ID
+		await c.env.DB.prepare(
+			'INSERT OR REPLACE INTO system_config (key, value, description, updated_at) VALUES (?, ?, ?, ?)'
+		).bind(
+			'github_app_id',
+			appId,
+			'GitHub App ID for API calls (supports multiple organizations)',
+			Date.now()
+		).run();
+
+		return c.json({
+			success: true,
+			message: message,
+			appId: appId,
+			keyConfigured: true,
+			supportsMultipleOrgs: true
+		});
+
+	} catch (error: any) {
+		console.error('[SETUP-KEY] Error:', error);
+		return c.json({
+			success: false,
+			message: `Error: ${error instanceof Error ? error.message : String(error)}`
+		}, 500);
+	}
+});
+
+/**
+ * POST /manual/test-github-token
+ * Test GitHub token generation and repository access
+ */
+app.post("/manual/test-github-token", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json();
+		const { installationId } = body;
+
+		if (!installationId) {
+			return c.json({ error: "installationId parameter required" }, 400);
+		}
+
+		// Try to generate a GitHub token
+		try {
+			const token = await c.env.DB.prepare(
+				'SELECT value FROM system_config WHERE key = ?'
+			).bind('github_app_private_key').first();
+
+			if (!token) {
+				return c.json({
+					success: false,
+					message: "GitHub App private key not found in system config. Use /manual/setup-github-key to configure it.",
+					tokenAvailable: false
+				});
+			}
+
+			return c.json({
+				success: true,
+				message: `GitHub token generation setup found for installation ${installationId}`,
+				tokenAvailable: true,
+				installationId: installationId
+			});
+
+		} catch (tokenError: any) {
+			return c.json({
+				success: false,
+				message: `Token generation failed: ${tokenError.message}`,
+				tokenAvailable: false
+			});
+		}
+
+	} catch (error: any) {
+		console.error('[TEST-TOKEN] Error:', error);
+		return c.json({
+			success: false,
+			message: `Error: ${error instanceof Error ? error.message : String(error)}`
+		}, 500);
+	}
+});
+
+/**
+ * GET /manual/check-status/:repo
+ * Check the status of operations for a specific repository
+ */
+app.get("/manual/check-status/:repo", async (c: HonoContext) => {
+	try {
+		const repo = c.req.param('repo');
+		if (!repo) {
+			return c.json({ error: "repo parameter required" }, 400);
+		}
+
+		// Check if repository exists in database
+		const repoData = await c.env.DB.prepare(
+			'SELECT * FROM repos WHERE full_name = ?'
+		).bind(repo).first();
+
+		// Check recent operations for this repo
+		const operations = await c.env.DB.prepare(
+			'SELECT * FROM colby_commands WHERE repo = ? ORDER BY created_at DESC LIMIT 5'
+		).bind(repo).all();
+
+		// Check if LLMs docs exist by trying to read the directory
+		let llmsStatus = 'unknown';
+		try {
+			const [owner, repoName] = repo.split('/');
+			// This would require a token to check, so we'll just return what we can
+			llmsStatus = 'check manually - files should be in .agents/llms/ directory';
+		} catch (error) {
+			llmsStatus = 'error checking';
+		}
+
+		return c.json({
+			repo: repo,
+			inDatabase: !!repoData,
+			repoData: repoData || null,
+			recentOperations: operations.results || [],
+			llmsStatus: llmsStatus,
+			timestamp: new Date().toISOString()
+		});
+
+	} catch (error: any) {
+		console.error('[STATUS] Error checking repo status:', error);
+		return c.json({
+			error: `Error: ${error instanceof Error ? error.message : String(error)}`,
+			timestamp: new Date().toISOString()
+		}, 500);
+	}
+});
+
+/**
+ * POST /manual/add-repo
+ * Manually add a repository to the database
+ */
+app.post("/manual/add-repo", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json();
+		const { repo, installationId } = body;
+
+		if (!repo) {
+			return c.json({ error: "repo parameter required" }, 400);
+		}
+
+		if (!installationId) {
+			return c.json({ error: "installationId parameter required" }, 400);
+		}
+
+		const [owner, repoName] = repo.split('/');
+		if (!owner || !repoName) {
+			return c.json({ error: "invalid repo format, should be owner/repo" }, 400);
+		}
+
+		// Check if repository already exists
+		const existing = await c.env.DB.prepare(
+			'SELECT * FROM repos WHERE full_name = ?'
+		).bind(repo).first();
+
+		if (existing) {
+			return c.json({
+				success: false,
+				message: `Repository ${repo} already exists in database`,
+				data: existing
+			});
+		}
+
+		// Add repository to database
+		const result = await c.env.DB.prepare(
+			'INSERT INTO repos (id, full_name, installation_id, default_branch, visibility, description, topics, last_synced) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		).bind(
+			Date.now(), // Use timestamp as ID for manual entries
+			repo,
+			installationId,
+			'main', // Assume main branch
+			'public', // Assume public for now
+			'Manually added repository',
+			'[]', // Empty topics array
+			Date.now()
+		).run();
+
+		if (result.success) {
+			return c.json({
+				success: true,
+				message: `Repository ${repo} added to database with installation ID ${installationId}`,
+				data: {
+					full_name: repo,
+					installation_id: installationId
+				}
+			});
+		} else {
+			return c.json({
+				success: false,
+				message: `Failed to add repository ${repo} to database`
+			}, 500);
+		}
+
+	} catch (error: any) {
+		console.error('[ADD-REPO] Error adding repository:', error);
+		return c.json({
+			success: false,
+			message: `Error: ${error instanceof Error ? error.message : String(error)}`
+		}, 500);
+	}
+});
+
+/**
+ * POST /manual/trigger-optimize
+ * Manual trigger for worker optimization for a specific repository
+ */
+app.post("/manual/trigger-optimize", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json();
+		const repo = body.repo;
+		const installationId = body.installationId;
+
+		if (!repo) {
+			return c.json({ error: "repo parameter required" }, 400);
+		}
+
+		// First try to look up the repository in the database
+		let repoData = await c.env.DB.prepare(
+			'SELECT installation_id FROM repos WHERE full_name = ?'
+		).bind(repo).first();
+
+		let finalInstallationId: number;
+
+		if (!repoData) {
+			// Repository not in database, try to use provided installationId or default
+			if (installationId) {
+				finalInstallationId = installationId;
+				console.log(`[MANUAL] Using provided installation ID ${installationId} for ${repo}`);
+			} else {
+				// Try to get the first available installation (assuming org-wide access)
+				const installations = await c.env.DB.prepare(
+					'SELECT installation_id FROM repos LIMIT 1'
+				).first();
+
+				if (installations) {
+					finalInstallationId = installations.installation_id as number;
+					console.log(`[MANUAL] Using fallback installation ID ${finalInstallationId} for ${repo}`);
+				} else {
+					return c.json({
+						success: false,
+						message: `Repository ${repo} not found in database and no installations available. Please provide installationId or ensure repository sync has run.`
+					}, 404);
+				}
+			}
+		} else {
+			finalInstallationId = repoData.installation_id as number;
+		}
+
+		// Create synthetic event for worker optimization
+		const syntheticEvent = {
+			kind: 'manual_trigger',
+			delivery: `manual-${Date.now()}`,
+			repo: repo,
+			author: 'manual-trigger',
+			installationId: finalInstallationId
+		};
+
+		// Get the PR_WORKFLOWS durable object
+		const doId = c.env.PR_WORKFLOWS.idFromName(`repo-${repo}`);
+		const stub = c.env.PR_WORKFLOWS.get(doId);
+
+		// Trigger worker optimization
+		const res = await stub.fetch('https://do/optimize-worker', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(syntheticEvent)
+		});
+
+		if (res.ok) {
+			return c.json({
+				success: true,
+				message: `Worker optimization triggered for ${repo} (using installation ID: ${finalInstallationId})`,
+				status: res.status
+			});
+		} else {
+			const errorText = await res.text();
+			return c.json({
+				success: false,
+				message: `Failed to trigger optimization: ${errorText}`,
+				status: res.status
+			}, 500);
+		}
+	} catch (error: any) {
+		console.error('[MANUAL] Error triggering optimization:', error);
+		return c.json({
+			success: false,
+			message: `Error: ${error instanceof Error ? error.message : String(error)}`
+		}, 500);
+	}
+});
+
+app.post("/github/webhook", async (c: HonoContext) => {
+	console.log("[MAIN] Webhook request received", {
+		method: c.req.method,
+		url: c.req.url,
+		userAgent: c.req.header("user-agent"),
+		contentType: c.req.header("content-type"),
+		contentLength: c.req.header("content-length"),
+		timestamp: new Date().toISOString(),
+	});
+
+	try {
+		// Read the body once and pass data instead of the request
+		console.log("[MAIN] Reading request headers...");
+		const delivery = c.req.header("x-github-delivery") || "";
+		const event = c.req.header("x-github-event") || "";
+		const signature = c.req.header("x-hub-signature-256") || "";
+
+		console.log("[MAIN] Headers extracted:", {
+			delivery: delivery.substring(0, 8) + "...",
+			event,
+			hasSignature: !!signature,
+		});
+
+		console.log("[MAIN] Reading request body...");
+		const bodyText = await c.req.text();
+		console.log("[MAIN] Body read successfully, length:", bodyText.length);
+
+		// Create webhook data object instead of passing request
+		const webhookData = {
+			delivery,
+			event,
+			signature,
+			bodyText,
+			headers: {
+				"x-github-delivery": delivery,
+				"x-github-event": event,
+				"x-hub-signature-256": signature,
+				"content-type": c.req.header("content-type") || "application/json",
+			},
+		};
+
+		console.log("[MAIN] Calling handleWebhook...");
+		const response = await handleWebhook(webhookData, c.env);
+		console.log("[MAIN] handleWebhook completed, status:", response.status);
+
+		return response;
+	} catch (error) {
+		console.error("[MAIN] ERROR in webhook handler:", error);
+		console.error(
+			"[MAIN] Error stack:",
+			error instanceof Error ? error.stack : "No stack available",
+		);
+		return new Response("Internal server error", { status: 500 });
+	}
+});
+
+/**
+ * Default export: Worker lifecycle hooks
+ * - fetch: delegates to Hono app
+ * - scheduled: triggers repo sync & discovery via cron (see wrangler.toml [triggers] crons)
+ */
+export default {
+	fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
+		app.fetch(req, env, ctx),
+
+	/**
+	 * CRON handler
+	 * Periodically:
+	 * 1) Lists app installations.
+	 * 2) For each installation, lists accessible repos.
+	 * 3) Inserts unseen repos into D1, fetches README, runs a quick summary, and marks sync timestamp.
+	 * Notes:
+	 * - This path intentionally does a *lightweight* summary (summarizeRepo) to keep cost low.
+	 * - Deep/structured analysis is handled elsewhere (ResearchOrchestrator or manual endpoints).
+	 */
+	scheduled: async (_evt: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
+		ctx.waitUntil(syncRepos(env));
+		ctx.waitUntil(backfillLlmDocs(env));
+	},
+};
+
+// Export Durable Object classes so Wrangler can register them
+export { ProfileScanner, PrWorkflow, ResearchOrchestrator };
+
+/**
+ * Synchronizes repositories by fetching and updating their metadata.
+ *
+ * @param env - The environment bindings, including database and API tokens.
+ */
+async function syncRepos(env: Env) {
+	const installations = await listInstallations(env);
+	const installationList = Array.isArray(installations) ? installations : [];
+	for (const inst of installationList) {
+		const token = await getInstallationToken(env, inst.id);
+		const repos = await listReposForInstallation(token);
+
+		for (const r of repos) {
+			const inserted = await insertRepoIfNew(env.DB, {
+				id: r.id,
+				full_name: r.full_name,
+				installation_id: inst.id,
+				default_branch: r.default_branch,
+				visibility: r.visibility,
+				description: r.description || "",
+				topics: r.topics || [],
+			});
+
+			if (inserted) {
+				// On first sighting of a repo, fetch README and store a quick summary.
+				const repoName = r.full_name.split("/")[1];
+				const readme = await fetchReadme(
+					token,
+					r.owner.login,
+					repoName,
+					r.default_branch,
+				);
+				const summary = await summarizeRepo(env, { meta: r, readme });
+				await env.DB.prepare(
+					"UPDATE repos SET summary=?, last_synced=? WHERE full_name=?",
+				)
+					.bind(summary, Date.now(), r.full_name)
+					.run();
+			} else {
+				// Existing repo: bump timestamp so we know it was seen in this cycle.
+				await markRepoSynced(env.DB, r.full_name);
+			}
+		}
+	}
+}
+
+/**
+ * Backfills LLMs documentation and worker optimization to existing repositories that have wrangler files but no .agents/llms directory.
+ *
+ * @param env - The environment bindings, including database and Durable Object namespace.
+ */
+async function backfillLlmDocs(env: Env) {
+	console.log('[SCHEDULED] Starting LLMs documentation and worker optimization backfill job');
+
+	try {
+		// Get all repositories from the database
+		const repos = await env.DB.prepare(`
+			SELECT full_name, installation_id
+			FROM projects
+			WHERE installation_id IS NOT NULL
+		`).all();
+
+		console.log(`[SCHEDULED] Found ${repos.results?.length || 0} repositories to check`);
+
+		let processedCount = 0;
+		let backfilledCount = 0;
+
+		for (const repo of repos.results || []) {
+			const repoName = repo.full_name as string;
+			const installationId = repo.installation_id as number;
+
+			try {
+				// Get installation token
+				const token = await getInstallationToken(env, installationId);
+				const [owner, repoOnly] = repoName.split('/');
+
+				// Check if repository already has LLMs documentation
+				const hasLlmDocs = await checkForLlmDocs(token, owner, repoOnly);
+
+				if (!hasLlmDocs) {
+					// Check if repository has wrangler files
+					const hasWrangler = await checkForWranglerFiles(token, owner, repoOnly);
+
+					if (hasWrangler) {
+						console.log(`[SCHEDULED] Backfilling LLMs docs for ${repoName}`);
+
+						// Create synthetic event to trigger LLMs docs creation
+						const syntheticEvent = {
+							kind: 'backfill_llms',
+							delivery: `backfill-${Date.now()}-${repoName}`,
+							repo: repoName,
+							author: 'scheduled-job',
+							installationId: installationId
+						};
+
+						// Get the PR_WORKFLOWS durable object and trigger both LLMs docs and optimization
+						const doId = env.PR_WORKFLOWS.idFromName(`repo-${repoName}`);
+						const stub = env.PR_WORKFLOWS.get(doId);
+
+						// First, create LLMs documentation
+						const llmsRes = await stub.fetch('https://do/create-llms-docs', {
+							method: 'POST',
+							headers: { 'content-type': 'application/json' },
+							body: JSON.stringify(syntheticEvent)
+						});
+
+						// Then, optimize the worker
+						const optimizeRes = await stub.fetch('https://do/optimize-worker', {
+							method: 'POST',
+							headers: { 'content-type': 'application/json' },
+							body: JSON.stringify(syntheticEvent)
+						});
+
+						if (llmsRes.ok && optimizeRes.ok) {
+							backfilledCount++;
+							console.log(`[SCHEDULED] Successfully backfilled LLMs docs and optimized ${repoName}`);
+						} else {
+							const llmsStatus = llmsRes.ok ? '✅' : `❌(${llmsRes.status})`;
+							const optimizeStatus = optimizeRes.ok ? '✅' : `❌(${optimizeRes.status})`;
+							console.log(`[SCHEDULED] Partial success for ${repoName}: LLMs ${llmsStatus}, Optimize ${optimizeStatus}`);
+							// Still count as backfilled if either succeeded
+							backfilledCount++;
+						}
+					}
+				}
+
+				processedCount++;
+
+				// Add small delay to avoid rate limiting
+				if (processedCount % 10 === 0) {
+					await new Promise(resolve => setTimeout(resolve, 1000));
+				}
+
+			} catch (error: any) {
+				console.log(`[SCHEDULED] Error processing ${repoName}:`, error instanceof Error ? error.message : String(error));
+			}
+		}
+
+		console.log(`[SCHEDULED] LLMs and optimization backfill completed: ${processedCount} processed, ${backfilledCount} optimized`);
+
+		// Log the backfill operation
+		try {
+			await env.DB.prepare(`
+				INSERT INTO scheduled_jobs (job_type, processed_count, success_count, created_at)
+				VALUES (?, ?, ?, ?)
+			`).bind('llms_and_optimize_backfill', processedCount, backfilledCount, Date.now()).run();
+		} catch (dbError) {
+			console.log('[SCHEDULED] Failed to log backfill operation (table may not exist):', dbError);
+		}
+
+	} catch (error: any) {
+		console.log('[SCHEDULED] Error in LLMs backfill job:', error);
+	}
+}
+
+/**
+ * Checks if a repository already has LLMs documentation.
+ *
+ * @param token - GitHub API token
+ * @param owner - Repository owner
+ * @param repo - Repository name
+ * @returns True if LLMs docs exist, false otherwise
+ */
+async function checkForLlmDocs(token: string, owner: string, repo: string): Promise<boolean> {
+	try {
+		const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/.agents/llms`, {
+			headers: {
+				Authorization: `token ${token}`,
+				Accept: 'application/vnd.github+json',
+				'User-Agent': 'Colby-GitHub-Bot/1.0'
+			}
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Checks if a repository has wrangler configuration files.
+ *
+ * @param token - GitHub API token
+ * @param owner - Repository owner
+ * @param repo - Repository name
+ * @returns True if wrangler files exist, false otherwise
+ */
+async function checkForWranglerFiles(token: string, owner: string, repo: string): Promise<boolean> {
+	try {
+		// Check for wrangler.jsonc first
+		const wranglerJsonc = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/wrangler.jsonc`, {
+			headers: {
+				Authorization: `token ${token}`,
+				Accept: 'application/vnd.github+json',
+				'User-Agent': 'Colby-GitHub-Bot/1.0'
+			}
+		});
+
+		if (wranglerJsonc.ok) {
+			return true;
+		}
+
+		// Check for wrangler.toml
+		const wranglerToml = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/wrangler.toml`, {
+			headers: {
+				Authorization: `token ${token}`,
+				Accept: 'application/vnd.github+json',
+				'User-Agent': 'Colby-GitHub-Bot/1.0'
+			}
+		});
+
+		return wranglerToml.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Fetches the README file of a repository.
+ *
+ * @param token - The GitHub API token for authentication.
+ * @param owner - The owner of the repository.
+ * @param repo - The name of the repository.
+ * @param branch - The branch from which to fetch the README.
+ * @returns The content of the README file.
+ */
+async function fetchReadme(
+	token: string,
+	owner: string,
+	repo: string,
+	branch: string,
+) {
+	const res = await fetch(
+		`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`,
+		{
+			headers: { Authorization: `token ${token}` },
+		},
+	);
+	if (res.ok) return await res.text();
+	return "";
+}
+
+/**
+ * POST /research/run
+ * ------------------
+ * Kicks off a research sweep via the ResearchOrchestrator DO.
+ * Request body may include:
+ * - queries?: string[]     → explicit search queries to run
+ * - categories?: string[]  → load active queries from D1 for these categories
+ *
+ * Returns 202 on accepted; use /research/status to poll.
+ */
+app.post("/research/run", async (c: HonoContext) => {
+	// Check for authentication - either webhook secret or frontend password
+	const providedSecret = c.req.header('X-Webhook-Secret');
+	const providedPassword = c.req.header('X-Frontend-Password');
+	const expectedSecret = c.env.GITHUB_WEBHOOK_SECRET;
+	const expectedPassword = c.env.FRONTEND_AUTH_PASSWORD;
+	
+	const isWebhookAuth = providedSecret && expectedSecret && providedSecret === expectedSecret;
+	const isFrontendAuth = providedPassword && expectedPassword && providedPassword === expectedPassword;
+	
+	if (!isWebhookAuth && !isFrontendAuth) {
+		return c.json({ error: "Invalid or missing authentication. Provide either X-Webhook-Secret or X-Frontend-Password header." }, 401);
+	}
+
+	if (!c.env.RESEARCH_ORCH) {
+		return c.json({ error: "Research orchestrator not available" }, 503);
+	}
+	const doId = c.env.RESEARCH_ORCH.idFromName("global");
+	const stub = c.env.RESEARCH_ORCH.get(doId);
+	const body = await c.req.json().catch(() => ({}));
+	const res = await stub.fetch("https://do/run", {
+		method: "POST",
+		body: JSON.stringify(body),
+	});
+	// Don't consume response body to avoid "Body has already been used" error
+	return new Response("research-run-started", { status: res.status });
+});
+
+/**
+ * GET /research/debug
+ * --------------------
+ * Debug endpoint to test Durable Object database access
+ */
+app.get("/research/debug", async (c: HonoContext) => {
+	if (!c.env.RESEARCH_ORCH) {
+		return c.json({ error: "Research orchestrator not available" }, 503);
+	}
+	
+	const doId = c.env.RESEARCH_ORCH.idFromName("global");
+	const stub = c.env.RESEARCH_ORCH.get(doId);
+	
+	try {
+		const res = await stub.fetch("https://do/debug", {
+			method: "GET",
+		});
+		const result = await res.text();
+		return c.text(result);
+	} catch (error) {
+		return c.json({ error: `Failed to debug research orchestrator: ${error instanceof Error ? error.message : String(error)}` }, 500);
+	}
+});
+
+/**
+ * POST /research/reset
+ * --------------------
+ * Reset the research orchestrator status
+ */
+app.post("/research/reset", async (c: HonoContext) => {
+	if (!c.env.RESEARCH_ORCH) {
+		return c.json({ error: "Research orchestrator not available" }, 503);
+	}
+	
+	const doId = c.env.RESEARCH_ORCH.idFromName("global");
+	const stub = c.env.RESEARCH_ORCH.get(doId);
+	
+	try {
+		const res = await stub.fetch("https://do/reset", {
+			method: "POST",
+		});
+		const result = await res.json() as any;
+		return c.json(result);
+	} catch (error) {
+		return c.json({ error: `Failed to reset research orchestrator: ${error instanceof Error ? error.message : String(error)}` }, 500);
+	}
+});
+
+/**
+ * GET /research/status
+ * --------------------
+ * Returns the last-known status of the ResearchOrchestrator run.
+ * Use this to monitor long sweeps triggered by /research/run or cron.
+ */
+app.get("/research/status", async (c: HonoContext) => {
+	if (!c.env.RESEARCH_ORCH) {
+		return c.html(`
+			<div class="error-card">
+				<h3>❌ Research Orchestrator Unavailable</h3>
+				<p>The research orchestrator is not available. Please check your configuration.</p>
+			</div>
+		`);
+	}
+	
+	const stub = c.env.RESEARCH_ORCH.get(
+		c.env.RESEARCH_ORCH.idFromName("global"),
+	);
+	const res = await stub.fetch("https://do/status");
+	
+	if (!res.ok) {
+		return c.html(`
+			<div class="error-card">
+				<h3>❌ Research Status Error</h3>
+				<p>Failed to fetch research status: ${res.status} ${res.statusText}</p>
+			</div>
+		`);
+	}
+	
+	try {
+		const statusData = await res.json() as any;
+		
+		// Format the status data into a nice HTML card
+		const statusHtml = `
+			<div class="status-card">
+				<div class="status-header">
+					<h3>🔬 Research Status</h3>
+					<div class="status-badge ${statusData.status === 'running' ? 'running' : statusData.status === 'completed' ? 'completed' : 'idle'}">
+						${statusData.status || 'Unknown'}
+					</div>
+				</div>
+				<div class="status-details">
+					${statusData.message ? `<p><strong>Message:</strong> ${statusData.message}</p>` : ''}
+					${statusData.started_at ? `<p><strong>Started:</strong> ${new Date(statusData.started_at).toLocaleString()}</p>` : ''}
+					${statusData.completed_at ? `<p><strong>Completed:</strong> ${new Date(statusData.completed_at).toLocaleString()}</p>` : ''}
+					${statusData.repositories_found ? `<p><strong>Repositories Found:</strong> ${statusData.repositories_found}</p>` : ''}
+					${statusData.repositories_analyzed ? `<p><strong>Repositories Analyzed:</strong> ${statusData.repositories_analyzed}</p>` : ''}
+					${statusData.queries_run ? `<p><strong>Queries Run:</strong> ${statusData.queries_run}</p>` : ''}
+					${statusData.error ? `<p class="error-text"><strong>Error:</strong> ${statusData.error}</p>` : ''}
+				</div>
+				<div class="status-actions">
+					<button onclick="showResearchModal()" class="btn btn-primary">🚀 Run New Research</button>
+					<button onclick="location.reload()" class="btn btn-secondary">🔄 Refresh</button>
+				</div>
+			</div>
+		`;
+		
+		return c.html(statusHtml);
+	} catch (error) {
+		return c.html(`
+			<div class="error-card">
+				<h3>❌ Parse Error</h3>
+				<p>Failed to parse research status: ${error instanceof Error ? error.message : String(error)}</p>
+			</div>
+		`);
+	}
+});
+
+/**
+ * GET /debug/repos
+ * ----------------
+ * Debug endpoint to see what repositories the bot can access
+ */
+app.get("/debug/repos", async (c: HonoContext) => {
+	try {
+		const installations = await listInstallations(c.env);
+		const installationList = Array.isArray(installations) ? installations : [];
+		const allRepos = [];
+
+		for (const inst of installationList) {
+			const token = await getInstallationToken(c.env, inst.id);
+			const repos = await listReposForInstallation(token);
+			
+			allRepos.push({
+				installation: inst,
+				repos: repos.map(r => ({
+					full_name: r.full_name,
+					owner: r.owner.login,
+					owner_type: (r as any).owner.type,
+					name: (r as any).name,
+					private: (r as any).private,
+					html_url: (r as any).html_url
+				}))
+			});
+		}
+
+		return c.json({
+			installations: installationList.length,
+			repositories: allRepos
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to list repositories", details: String(error) }, 500);
+	}
+});
+
+/**
+ * GET /debug/operations
+ * Debug endpoint to see all operations in the database
+ */
+app.get("/debug/operations", async (c: HonoContext) => {
+	try {
+		const operations = await c.env.DB.prepare(`
+      SELECT * FROM operation_progress
+      ORDER BY created_at DESC
+      LIMIT 50
+    `).all();
+
+		return c.json({
+			total: operations.results?.length || 0,
+			operations: operations.results || []
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch operations", details: String(error) }, 500);
+	}
+});
+
+/**
+ * GET /setup
+ * GitHub App setup page with automated configuration
+ */
+app.get("/setup", async (c: HonoContext) => {
+	const baseUrl = c.req.header('host') ? `https://${c.req.header('host')}` : 'https://gh-bot.hacolby.workers.dev';
+	
+	const manifest = {
+		name: "Colby GitHub Bot",
+		url: baseUrl,
+		description: "AI-powered GitHub workflow automation and research.",
+		public: false,
+		hook_attributes: {
+			url: `${baseUrl}/github/webhook`,
+			active: true
+		},
+		redirect_url: `${baseUrl}/github/manifest/callback`,
+		callback_urls: [
+			`${baseUrl}/github/oauth/callback`
+		],
+		default_permissions: {
+			metadata: "read",
+			contents: "read",
+			issues: "write",
+			pull_requests: "write",
+			checks: "read",
+			actions: "read"
+		},
+		default_events: [
+			"issues",
+			"issue_comment",
+			"pull_request",
+			"pull_request_review",
+			"check_suite",
+			"check_run",
+			"push"
+		]
+	};
+
+	const setupHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Colby GitHub Bot - Setup</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f6f8fa; }
+        .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; padding: 30px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .header { text-align: center; margin-bottom: 30px; }
+        .step { margin: 20px 0; padding: 20px; border: 1px solid #e1e4e8; border-radius: 6px; }
+        .step h3 { margin-top: 0; color: #24292e; }
+        .code-block { background: #f6f8fa; padding: 15px; border-radius: 6px; font-family: 'SF Mono', Monaco, monospace; font-size: 14px; overflow-x: auto; position: relative; }
+        .code-block-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #e1e4e8; }
+        .code-block-title { font-weight: 600; color: #24292e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .copy-btn { background: #0366d6; color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: inherit; }
+        .copy-btn:hover { background: #0256cc; }
+        .copy-btn.copied { background: #28a745; }
+        .json-block { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 6px; margin: 15px 0; overflow: hidden; }
+        .json-content { padding: 15px; font-family: 'SF Mono', Monaco, monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-x: auto; }
+        .code-content { padding: 15px; font-family: 'SF Mono', Monaco, monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-x: auto; }
+        .btn { display: inline-block; padding: 10px 20px; background: #0366d6; color: white; text-decoration: none; border-radius: 6px; margin: 10px 5px; }
+        .btn:hover { background: #0256cc; }
+        .warning { background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 6px; margin: 15px 0; }
+        .success { background: #d4edda; border: 1px solid #c3e6cb; padding: 15px; border-radius: 6px; margin: 15px 0; }
+        .form-group { margin: 15px 0; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: 600; }
+        .form-group input { width: 100%; padding: 8px; border: 1px solid #d1d5da; border-radius: 4px; }
+        .form-group textarea { width: 100%; height: 200px; padding: 8px; border: 1px solid #d1d5da; border-radius: 4px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Colby GitHub Bot Setup</h1>
+            <p>Automated setup for your GitHub App installation</p>
+        </div>
+
+        <div class="step">
+            <h3>📋 Step 1: Create GitHub App Manifest</h3>
+            <p>Copy the manifest JSON below and save it as <code>colby-app-manifest.json</code>:</p>
+            <div class="json-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Manifest JSON</span>
+                    <button class="copy-btn" onclick="copyToClipboard('manifest-json')">📋 Copy</button>
+                </div>
+                <div class="json-content" id="manifest-json">${JSON.stringify(manifest, null, 2)}</div>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>🚀 Step 2: Create GitHub App via Manifest</h3>
+            <p>Use the GitHub App Manifest flow to create your app:</p>
+            
+            <h4>Option A: Automated Manifest Creation (Recommended)</h4>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Shell Command</span>
+                    <button class="copy-btn" onclick="copyToClipboard('cli-create-command')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="cli-create-command"># First, make sure you're signed in to GitHub CLI
+gh auth status
+
+# Generate a webhook secret
+WEBHOOK_SECRET=$(openssl rand -hex 32)
+echo "Generated webhook secret: $WEBHOOK_SECRET"
+
+# Create the manifest JSON file
+cat > manifest.json << 'EOF'
+{
+  "name": "Colby GitHub Bot",
+  "url": "https://gh-bot.hacolby.workers.dev",
+  "description": "AI-powered GitHub workflow automation and research.",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://gh-bot.hacolby.workers.dev/github/webhook",
+    "active": true
+  },
+  "redirect_url": "https://gh-bot.hacolby.workers.dev/github/manifest/callback",
+  "callback_urls": [
+    "https://gh-bot.hacolby.workers.dev/github/oauth/callback"
+  ],
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "read",
+    "issues": "write",
+    "pull_requests": "write",
+    "checks": "read",
+    "actions": "read"
+  },
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "check_suite",
+    "check_run",
+    "push"
+  ]
+}
+EOF
+
+# Generate the manifest URL and open it
+MANIFEST_QS=$(python3 -c "import json,urllib.parse; print(urllib.parse.quote(open('manifest.json').read()))")
+echo "Opening: https://github.com/settings/apps/new?manifest=$MANIFEST_QS"
+open "https://github.com/settings/apps/new?manifest=$MANIFEST_QS"
+
+echo "After creating the app, GitHub will redirect you to:"
+echo "https://gh-bot.hacolby.workers.dev/github/manifest/callback?code=YOUR_CODE"
+echo "Copy the code from the URL and use it in the next step."</div>
+            </div>
+            
+            <h4>Option B: Manual Manifest Form (Fallback)</h4>
+            <p>If the CLI method doesn't work, use the manual form approach:</p>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Manual Steps</span>
+                    <button class="copy-btn" onclick="copyToClipboard('manual-steps')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="manual-steps"># 1. Go to GitHub App creation page
+open "https://github.com/settings/apps/new"
+
+# 2. Fill in the form manually with these values:
+# - App name: Colby GitHub Bot
+# - Homepage URL: https://gh-bot.hacolby.workers.dev
+# - Webhook URL: https://gh-bot.hacolby.workers.dev/github/webhook
+# - Webhook secret: (generate a random string)
+# - Permissions: See the JSON manifest below for exact permissions
+# - Events: issues, issue_comment, pull_request, pull_request_review, check_suite, check_run, push</div>
+            </div>
+            
+            <h4>Option C: Direct Manifest Link (Alternative)</h4>
+            <p>If you prefer the manifest approach, try this direct link:</p>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Direct URL</span>
+                    <button class="copy-btn" onclick="copyToClipboard('direct-url')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="direct-url">https://github.com/settings/apps/new?manifest=${encodeURIComponent(JSON.stringify(manifest))}</div>
+            </div>
+            
+            
+            <div class="warning">
+                <strong>⚠️ Important:</strong> After clicking "Create GitHub App", GitHub will redirect to your callback URL with a code. You'll need to exchange this code for credentials in the next step.
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>🔧 Step 3: Get App Credentials</h3>
+            <p>After creating the app, you'll need to get the credentials for your Cloudflare Worker:</p>
+            
+            <h4>If you used Option A (Manifest Creation):</h4>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Exchange Code for Credentials</span>
+                    <button class="copy-btn" onclick="copyToClipboard('manifest-credentials')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="manifest-credentials"># After creating the app via manifest, GitHub redirects with a code
+# Replace YOUR_CODE with the actual code from the redirect URL
+CODE="YOUR_CODE"
+
+# Exchange the code for app credentials
+gh api -X POST \\
+  -H "Accept: application/vnd.github+json" \\
+  "/app-manifests/$CODE/conversions" \\
+  > app_credentials.json
+
+# Extract the credentials
+echo "App created! Here are your credentials:"
+echo "App ID: $(jq -r '.id' app_credentials.json)"
+echo "App Slug: $(jq -r '.slug' app_credentials.json)"
+echo "Webhook Secret: $(jq -r '.webhook_secret' app_credentials.json)"
+
+# Save the private key
+jq -r '.pem' app_credentials.json > gh_app_private_key.pem
+echo "Private key saved to: gh_app_private_key.pem"
+
+# Generate environment variables
+echo "=== Environment Variables for Cloudflare Worker ==="
+echo "GITHUB_APP_ID=$(jq -r '.id' app_credentials.json)"
+echo "GITHUB_WEBHOOK_SECRET=$(jq -r '.webhook_secret' app_credentials.json)"
+echo "GITHUB_CLIENT_ID=$(jq -r '.client_id' app_credentials.json)"
+echo "GITHUB_CLIENT_SECRET=$(jq -r '.client_secret' app_credentials.json)"
+echo "SUMMARY_CF_MODEL=@cf/meta/llama-3.1-8b-instruct"</div>
+            </div>
+            
+            <h4>If you used the Manifest Form:</h4>
+            <p>After GitHub redirects to your callback URL, extract the code and exchange it for app credentials:</p>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Shell Commands</span>
+                    <button class="copy-btn" onclick="copyToClipboard('credentials-commands')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="credentials-commands"># Extract the code from the redirect URL (e.g., ?code=abc123)
+CODE="paste_the_code_from_redirect_url_here"
+
+# Exchange manifest code for credentials
+gh api -X POST \\
+  -H "Accept: application/vnd.github+json" \\
+  "/app-manifests/\${CODE}/conversions" > app_credentials.json
+
+# Extract key bits for your Cloudflare Worker
+jq -r '.pem' app_credentials.json > gh_app_private_key.pem
+jq -r '"GITHUB_APP_ID=\(.id)\\nGITHUB_WEBHOOK_SECRET=\(.webhook_secret)\\nGITHUB_CLIENT_ID=\(.client_id)\\nGITHUB_CLIENT_SECRET=\(.client_secret)"' app_credentials.json
+
+# Your Cloudflare Worker environment variables:
+CF_ACCOUNT_ID=your_account_id
+CF_API_TOKEN=your_api_token
+SUMMARY_CF_MODEL=@cf/meta/llama-2-7b-chat-fp16</div>
+            </div>
+            
+            <div class="warning">
+                <strong>⚠️ Time Limit:</strong> The manifest code expires in ~1 hour, so complete this step quickly after creating the app.
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>📱 Step 4: Install the App</h3>
+            <p>After creating the app, install it on your repositories:</p>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Installation Commands</span>
+                    <button class="copy-btn" onclick="copyToClipboard('install-commands')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="install-commands"># Install on personal repositories
+gh api /user/installations
+
+# Install on organization repositories  
+gh api /orgs/your-org/installations</div>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>✅ Step 5: Verify Installation</h3>
+            <p>Test that everything is working:</p>
+            <div class="code-block">
+                <div class="code-block-header">
+                    <span class="code-block-title">Verification Commands</span>
+                    <button class="copy-btn" onclick="copyToClipboard('verify-commands')">📋 Copy</button>
+                </div>
+                <div class="code-content" id="verify-commands"># Check if the bot can access repositories
+curl \${baseUrl}/debug/repos
+
+# Test the webhook (replace with your actual webhook URL)
+curl -X POST \${baseUrl}/github/webhook \\
+  -H "Content-Type: application/json" \\
+  -H "X-GitHub-Event: ping" \\
+  -d '{"zen":"Keep it logically awesome."}'</div>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>🆘 Troubleshooting</h3>
+            <p>If you encounter issues:</p>
+            <ul>
+                <li><strong>Blank manifest form:</strong> Sign in to GitHub first, then refresh the page</li>
+                <li><strong>GitHub CLI not authenticated:</strong> Run <code>gh auth login</code> and follow the prompts</li>
+                <li><strong>Webhook URL not accessible:</strong> Ensure your Cloudflare Worker is deployed and accessible</li>
+                <li><strong>Environment variables:</strong> Verify all required variables are set in your Cloudflare Worker</li>
+                <li><strong>Debug information:</strong> Check the <a href="/debug/operations">operations debug page</a> for errors</li>
+            </ul>
+            
+                    <h4>Common Solutions:</h4>
+                    <div class="code-block">
+                        <div class="code-block-header">
+                            <span class="code-block-title">Troubleshooting Commands</span>
+                            <button class="copy-btn" onclick="copyToClipboard('troubleshoot-commands')">📋 Copy</button>
+                        </div>
+                        <div class="code-content" id="troubleshoot-commands"># Check GitHub CLI authentication
+gh auth status
+
+# Re-authenticate if needed
+gh auth login
+
+# Test webhook accessibility
+curl -I https://gh-bot.hacolby.workers.dev/github/webhook
+
+# Check if the worker is responding
+curl https://gh-bot.hacolby.workers.dev/debug/repos
+
+# If manifest form is blank, try this alternative approach:
+# 1. Go directly to: https://github.com/settings/apps/new
+# 2. Fill in the form manually using the manifest JSON above
+# 3. Use the same redirect URL: https://gh-bot.hacolby.workers.dev/github/manifest/callback</div>
+                    </div>
+                    
+                    <h4>Blank Form Fix:</h4>
+                    <p>If the manifest form appears blank, try these solutions:</p>
+                    <ul>
+                        <li><strong>Clear browser cache</strong> and try again</li>
+                        <li><strong>Use incognito/private mode</strong> to avoid cache issues</li>
+                        <li><strong>Try a different browser</strong> (Chrome, Firefox, Safari)</li>
+                        <li><strong>Manual form entry</strong> - Go to <code>https://github.com/settings/apps/new</code> and fill in manually</li>
+                        <li><strong>Check network connectivity</strong> - Ensure you can access GitHub normally</li>
+                    </ul>
+        </div>
+
+        <div style="text-align: center; margin-top: 30px;">
+            <a href="/" class="btn">← Back to Dashboard</a>
+            <a href="/help" class="btn">📖 View Help</a>
+            <a href="/setup" class="btn">⚙️ Setup GitHub App</a>
+        </div>
+    </div>
+
+    <script>
+        function copyToClipboard(elementId) {
+            const element = document.getElementById(elementId);
+            const text = element.textContent || element.innerText;
+            
+            // Use the modern clipboard API if available
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(() => {
+                    showCopySuccess(elementId);
+                }).catch(err => {
+                    fallbackCopyTextToClipboard(text, elementId);
+                });
+            } else {
+                fallbackCopyTextToClipboard(text, elementId);
+            }
+        }
+        
+        function fallbackCopyTextToClipboard(text, elementId) {
+            const textArea = document.createElement("textarea");
+            textArea.value = text;
+            textArea.style.position = "fixed";
+            textArea.style.left = "-999999px";
+            textArea.style.top = "-999999px";
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            
+            try {
+                document.execCommand('copy');
+                showCopySuccess(elementId);
+            } catch (err) {
+                console.error('Fallback: Could not copy text: ', err);
+            }
+            
+            document.body.removeChild(textArea);
+        }
+        
+        function showCopySuccess(elementId) {
+            const button = document.querySelector('[onclick="copyToClipboard(\\'' + elementId + '\\')"]');
+            const originalText = button.textContent;
+            button.textContent = '✅ Copied!';
+            button.classList.add('copied');
+            
+            setTimeout(() => {
+                button.textContent = originalText;
+                button.classList.remove('copied');
+            }, 2000);
+        }
+    </script>
+</body>
+</html>`;
+
+	return c.html(setupHtml);
+});
+
+/**
+ * POST /setup/auto
+ * Automated setup using personal access token
+ */
+app.post("/setup/auto", async (c: HonoContext) => {
+	try {
+		const { personalToken, appName, description } = await c.req.json();
+		
+		if (!personalToken) {
+			return c.json({ error: "Personal access token is required" }, 400);
+		}
+
+		const baseUrl = c.req.header('host') ? `https://${c.req.header('host')}` : 'https://gh-bot.hacolby.workers.dev';
+		
+		// Note: The automated setup via personal token is not supported for GitHub Apps
+		// GitHub Apps must be created via the manifest flow for security reasons
+		return c.json({
+			error: "Automated GitHub App creation not supported",
+			message: "GitHub Apps must be created using the manifest flow for security reasons. Please use the manual setup process at /setup",
+			manifest: {
+				name: appName || "Colby GitHub Bot",
+				url: baseUrl,
+				description: description || "AI-powered GitHub workflow automation and research.",
+				public: false,
+				hook_attributes: {
+					url: `${baseUrl}/github/webhook`,
+					active: true
+				},
+				redirect_url: `${baseUrl}/github/manifest/callback`,
+				callback_urls: [
+					`${baseUrl}/github/oauth/callback`
+				],
+				default_permissions: {
+					metadata: "read",
+					contents: "read",
+					issues: "write",
+					pull_requests: "write",
+					checks: "read",
+					actions: "read"
+				},
+				default_events: [
+					"issues",
+					"issue_comment",
+					"pull_request",
+					"pull_request_review",
+					"check_suite",
+					"check_run",
+					"push"
+				]
+			},
+			next_steps: [
+				"Use the manifest above with the manual setup process",
+				"Visit /setup for complete instructions",
+				"Follow the manifest flow to create your GitHub App"
+			]
+		}, 400);
+
+	} catch (error) {
+		return c.json({ 
+			error: "Setup failed", 
+			details: String(error) 
+		}, 500);
+	}
+});
+
+/**
+ * GET /github/manifest/callback
+ * Handle GitHub App manifest callback
+ */
+app.get("/github/manifest/callback", async (c: HonoContext) => {
+	const code = c.req.query("code");
+	const state = c.req.query("state");
+	
+	if (!code) {
+		return c.html(`
+			<!DOCTYPE html>
+			<html>
+			<head><title>GitHub App Setup - Error</title></head>
+			<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; text-align: center;">
+				<h2>❌ Setup Error</h2>
+				<p>No authorization code received from GitHub.</p>
+				<p>Please try the setup process again.</p>
+				<a href="/setup" style="color: #0366d6;">← Back to Setup</a>
+			</body>
+			</html>
+		`);
+	}
+
+	return c.html(`
+		<!DOCTYPE html>
+		<html>
+		<head>
+			<title>GitHub App Setup - Success</title>
+			<style>
+				body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f6f8fa; }
+				.container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+				.code-block { background: #f6f8fa; padding: 15px; border-radius: 6px; font-family: 'SF Mono', Monaco, monospace; margin: 15px 0; word-break: break-all; position: relative; }
+				.code-block-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #e1e4e8; }
+				.code-block-title { font-weight: 600; color: #24292e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+				.copy-btn { background: #0366d6; color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: inherit; }
+				.copy-btn:hover { background: #0256cc; }
+				.copy-btn.copied { background: #28a745; }
+				.btn { display: inline-block; padding: 10px 20px; background: #0366d6; color: white; text-decoration: none; border-radius: 6px; margin: 10px 5px; }
+				.success { background: #d4edda; border: 1px solid #c3e6cb; padding: 15px; border-radius: 6px; margin: 15px 0; }
+			</style>
+		</head>
+		<body>
+			<div class="container">
+				<h2>✅ GitHub App Created Successfully!</h2>
+				
+				<div class="success">
+					<strong>Next Step:</strong> Exchange the authorization code for your app credentials.
+				</div>
+				
+				<h3>🔑 Exchange Code for Credentials</h3>
+				<p>Copy the code below and run these commands in your terminal:</p>
+				
+				<div class="code-block">
+					<div class="code-block-header">
+						<span class="code-block-title">Authorization Code</span>
+						<button class="copy-btn" onclick="copyToClipboard('auth-code')">📋 Copy</button>
+					</div>
+					<div class="code-content" id="auth-code">${code}</div>
+				</div>
+				
+				<h4>Run these commands:</h4>
+				<div class="code-block">
+					<div class="code-block-header">
+						<span class="code-block-title">Shell Commands</span>
+						<button class="copy-btn" onclick="copyToClipboard('callback-commands')">📋 Copy</button>
+					</div>
+					<div class="code-content" id="callback-commands"># Exchange the code for credentials
+gh api -X POST \\
+  -H "Accept: application/vnd.github+json" \\
+  "/app-manifests/\${code}/conversions" > app_credentials.json
+
+# Extract the credentials
+jq -r '.pem' app_credentials.json > gh_app_private_key.pem
+jq -r '"GITHUB_APP_ID=\(.id)\\nGITHUB_WEBHOOK_SECRET=\(.webhook_secret)\\nGITHUB_CLIENT_ID=\(.client_id)\\nGITHUB_CLIENT_SECRET=\(.client_secret)"' app_credentials.json</div>
+				</div>
+				
+				<div style="background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 6px; margin: 15px 0;">
+					<strong>⚠️ Important:</strong> This code expires in ~1 hour. Complete the exchange process quickly!
+				</div>
+				
+				<div style="text-align: center; margin-top: 30px;">
+					<a href="/setup" class="btn">← Back to Setup Guide</a>
+					<a href="/" class="btn">🏠 Dashboard</a>
+				</div>
+			</div>
+		</body>
+		<script>
+			function copyToClipboard(elementId) {
+				const element = document.getElementById(elementId);
+				const text = element.textContent || element.innerText;
+				
+				// Use the modern clipboard API if available
+				if (navigator.clipboard && window.isSecureContext) {
+					navigator.clipboard.writeText(text).then(() => {
+						showCopySuccess(elementId);
+					}).catch(err => {
+						fallbackCopyTextToClipboard(text, elementId);
+					});
+				} else {
+					fallbackCopyTextToClipboard(text, elementId);
+				}
+			}
+			
+			function fallbackCopyTextToClipboard(text, elementId) {
+				const textArea = document.createElement("textarea");
+				textArea.value = text;
+				textArea.style.position = "fixed";
+				textArea.style.left = "-999999px";
+				textArea.style.top = "-999999px";
+				document.body.appendChild(textArea);
+				textArea.focus();
+				textArea.select();
+				
+				try {
+					document.execCommand('copy');
+					showCopySuccess(elementId);
+				} catch (err) {
+					console.error('Fallback: Could not copy text: ', err);
+				}
+				
+				document.body.removeChild(textArea);
+			}
+			
+			function showCopySuccess(elementId) {
+				const button = document.querySelector('[onclick="copyToClipboard(\\'' + elementId + '\\')"]');
+				const originalText = button.textContent;
+				button.textContent = '✅ Copied!';
+				button.classList.add('copied');
+				
+				setTimeout(() => {
+					button.textContent = originalText;
+					button.classList.remove('copied');
+				}, 2000);
+			}
+		</script>
+		</html>
+	`);
+});
+
+/**
+ * GET /research/results
+ * ---------------------
+ * Returns ranked project results from D1, optionally enriched with AI analysis.
+ * Query params:
+ * - min_score (number, default 0.6): minimum project score to include
+ * - limit     (number, default 50, max 200)
+ *
+ * Sorting:
+ * - p.score DESC, then analysis confidence DESC, then recency.
+ */
+app.get("/research/results", async (c: HonoContext) => {
+	try {
+		const minScore = c.req.query("min_score");
+		const limitParam = c.req.query("limit");
+
+		// Validate and sanitize inputs
+		const min = minScore ? Math.max(0, Math.min(1, Number(minScore))) : 0.6;
+		const requestedLimit = limitParam ? Number(limitParam) : 50;
+		const lim = Math.max(1, Math.min(requestedLimit, 200)); // Cap at 200, minimum 1
+
+		// Validate numeric inputs
+		if (minScore && (Number.isNaN(min) || min < 0 || min > 1)) {
+			return c.json(
+				{ error: "min_score must be a number between 0 and 1" },
+				400,
+			);
+		}
+		if (limitParam && (Number.isNaN(requestedLimit) || requestedLimit < 1)) {
+			return c.json({ error: "limit must be a positive number" }, 400);
+		}
+
+		// First check if we have any projects at all
+		const countResult = await c.env.DB.prepare(
+			"SELECT COUNT(*) as count FROM projects",
+		).first();
+		const totalProjects = (countResult as { count: number })?.count || 0;
+
+		if (totalProjects === 0) {
+		return c.html(`
+			<div class="no-results-card">
+				<h3>📊 No Research Results Found</h3>
+				<p>No projects have been analyzed yet. Run a research sweep to discover and analyze Cloudflare Workers repositories.</p>
+				<div class="no-results-actions">
+					<button onclick="showResearchModal()" class="btn btn-primary">🚀 Run Research Sweep</button>
+				</div>
+			</div>
+		`);
+		}
+
+		const rows = await c.env.DB.prepare(`
+      SELECT
+        p.full_name, p.html_url, p.stars, p.score,
+        p.short_summary, p.long_summary, p.updated_at,
+        ra.purpose, ra.summary_short as ai_summary_short,
+        ra.confidence, ra.risk_flags_json, ra.analyzed_at
+      FROM projects p
+      LEFT JOIN repo_analysis ra ON p.full_name = ra.repo_full_name
+      WHERE p.score >= ?
+      ORDER BY p.score DESC, ra.confidence DESC NULLS LAST
+      LIMIT ?
+    `)
+			.bind(min, lim)
+			.all();
+
+		// Check if this is a request for HTML (from dashboard)
+		const acceptHeader = c.req.header("Accept") || "";
+		const isHTMLRequest =
+			acceptHeader.includes("text/html") || c.req.header("HX-Request");
+
+		if (isHTMLRequest) {
+			if (!rows.results || rows.results.length === 0) {
+				return c.html('<div class="loading">No repositories found</div>');
+			}
+
+			const repos = (rows.results as Array<{
+				full_name: string;
+				html_url: string;
+				stars: number;
+				score: number;
+				short_summary?: string;
+				long_summary?: string;
+			}>)
+			
+			// Process repos with badges asynchronously
+			const reposWithBadges = await Promise.all(
+				repos.map(async (repo) => {
+					const stars = repo.stars || 0;
+					const score = repo.score ? (repo.score * 100).toFixed(1) : "N/A";
+
+					// Generate badges for this repo
+					const badgeResult = await detectRepoBadges(repo);
+					const badgesHtml = badgeResult.badges.map(badge => 
+						`<span class="badge" style="background-color: ${badge.color}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-right: 4px; display: inline-block;">${badge.label}</span>`
+					).join('');
+
+					return `
+          <div class="practice-item">
+            <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+              <div>
+                <h4><a href="${repo.html_url}" target="_blank" style="color: #0366d6;">${repo.full_name}</a></h4>
+                <div class="operation-meta">⭐ ${stars} stars • Score: ${score}%</div>
+                <div style="margin-top: 8px;">${badgesHtml}</div>
+              </div>
+              <button onclick="openRepoModal('${repo.full_name}')" class="btn btn-secondary" style="font-size: 12px;">View Details</button>
+            </div>
+            <div style="margin-bottom: 10px;">${repo.short_summary || "No summary available"}</div>
+            ${repo.long_summary ? `<div style="font-size: 14px; color: #586069;">${repo.long_summary.slice(0, 200)}...</div>` : ""}
+          </div>
+        `;
+				})
+			);
+			
+			const html = reposWithBadges.join("");
+
+			return c.html(html);
+		}
+
+		// Format results as JSON for non-HTML requests
+		return c.json({
+			results: rows.results || [],
+			total: totalProjects,
+			showing: (rows.results || []).length,
+			minScore: min
+		});
+	} catch (error) {
+		return c.json(
+			{
+				error: "Database query failed",
+				details: String(error),
+				results: [],
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * GET /research/analysis
+ * ----------------------
+ * Returns the raw analysis row for a specific repo.
+ * Query params:
+ * - repo = "owner/name" (required)
+ */
+app.get("/research/analysis", async (c: HonoContext) => {
+	try {
+		const repo = c.req.query("repo");
+		if (!repo)
+			return c.json(
+				{ error: "repo parameter required", example: "?repo=owner/name" },
+				400,
+			);
+
+		// Input validation - detect potential SQL injection attempts
+		if (
+			repo.includes(";") ||
+			repo.includes("--") ||
+			repo.includes("DROP") ||
+			repo.includes("DELETE") ||
+			repo.includes("INSERT") ||
+			repo.includes("UPDATE") ||
+			repo.includes("UNION") ||
+			repo.includes("/*") ||
+			repo.includes("*/") ||
+			repo.includes("\\")
+		) {
+			return c.json(
+				{
+					error: "Invalid repository name format",
+					message: 'Repository names should be in format "owner/name"',
+					hint: "Special characters and SQL keywords are not allowed",
+				},
+				400,
+			);
+		}
+
+		// Basic format validation for owner/repo pattern
+		if (
+			!repo.includes("/") ||
+			repo.split("/").length !== 2 ||
+			repo.startsWith("/") ||
+			repo.endsWith("/")
+		) {
+			return c.json(
+				{
+					error: "Invalid repository format",
+					message: 'Repository must be in format "owner/name"',
+					example: "cloudflare/workers-sdk",
+				},
+				400,
+			);
+		}
+
+		const [owner, repoName] = repo.split("/");
+		if (!owner.trim() || !repoName.trim()) {
+			return c.json(
+				{
+					error: "Invalid repository format",
+					message: "Both owner and repository name are required",
+					example: "cloudflare/workers-sdk",
+				},
+				400,
+			);
+		}
+
+		const row = await c.env.DB.prepare(
+			"SELECT * FROM repo_analysis WHERE repo_full_name=?",
+		)
+			.bind(repo)
+			.first();
+
+		if (!row) {
+			// Return 200 with helpful information instead of 404
+			return c.json(
+				{
+					message: `No analysis found for repository '${repo}'`,
+					repo: repo,
+					suggestions: [
+						"Run analysis with: POST /research/analyze",
+						"Check if the repository exists and is accessible",
+						"Browse available analyses at: GET /research/results",
+					],
+					status: "no_data",
+				},
+				200,
+			);
+		}
+
+		return c.json({
+			message: "Analysis data found",
+			repo: repo,
+			analysis: row,
+			status: "success",
+		});
+	} catch (error) {
+		return c.json(
+			{
+				error: "Database query failed",
+				details: String(error),
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * GET /research/risks
+ * -------------------
+ * “Safety board” view. Lists repos with non-empty risk flags, ordered by
+ * analysis confidence (desc) and project score (desc).
+ * Useful for triaging suspicious/vague repos (e.g., proxy/vpn, abuse-risk).
+ */
+app.get("/research/risks", async (c: HonoContext) => {
+	try {
+		// First check if we have any analysis data
+		const analysisCount = await c.env.DB.prepare(
+			"SELECT COUNT(*) as count FROM repo_analysis",
+		).first();
+		const totalAnalysis = (analysisCount as { count: number })?.count || 0;
+
+		if (totalAnalysis === 0) {
+			return c.json({
+				message:
+					"No repository analysis data found. Run analyses first with POST /research/analyze",
+				total_analyses: 0,
+				results: [],
+			});
+		}
+
+		const rows = await c.env.DB.prepare(`
+      SELECT
+        ra.repo_full_name, ra.purpose, ra.summary_short,
+        ra.risk_flags_json, ra.confidence, ra.analyzed_at,
+        p.html_url, p.stars, p.score
+      FROM repo_analysis ra
+      LEFT JOIN projects p ON ra.repo_full_name = p.full_name
+      WHERE ra.risk_flags_json != '[]' AND ra.risk_flags_json IS NOT NULL
+      ORDER BY ra.confidence DESC, p.score DESC NULLS LAST
+      LIMIT 100
+    `).all();
+
+		return c.json({
+			total_analyses: totalAnalysis,
+			results: (rows.results || []).map((row: any) => ({
+				...row,
+				risk_flags: JSON.parse(row.risk_flags_json || "[]"),
+			})),
+		});
+	} catch (error) {
+		return c.json(
+			{
+				error: "Database query failed",
+				details: String(error),
+				results: [],
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * POST /research/analyze
+ * ----------------------
+ * Manually run the lightweight code analysis for a specific repo.
+ * Body:
+ * { owner: string, repo: string, force?: boolean=false }
+ * Behavior:
+ * - if existing analysis is fresh (<24h) and force=false → returns a message instead of re-running.
+ * - otherwise fetches default branch, samples code, calls AI, and stores results.
+ */
+app.post("/research/analyze", async (c: HonoContext) => {
+	const body = await c.req.json().catch(() => ({}));
+	const { owner, repo, force = false } = body;
+
+	if (!owner || !repo) {
+		return c.json({ error: "owner and repo required" }, 400);
+	}
+
+	try {
+		const installations = await listInstallations(c.env);
+		const installationList = Array.isArray(installations) ? installations : [];
+		if (installationList.length === 0) {
+			return c.json({ error: "No GitHub installations available" }, 400);
+		}
+		const token = await getInstallationToken(c.env, installationList[0].id);
+
+		if (!force) {
+			const existing = await c.env.DB.prepare(
+				"SELECT analyzed_at FROM repo_analysis WHERE repo_full_name = ?",
+			)
+				.bind(`${owner}/${repo}`)
+				.first();
+			if (existing) {
+				const age = Date.now() - (existing as { analyzed_at: number }).analyzed_at;
+				const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+				if (age < maxAge) {
+					return c.json(
+						{ message: "Analysis is recent, use force=true to override" },
+						200,
+					);
+				}
+			}
+		}
+
+		const repoInfo = (await fetch(
+			`https://api.github.com/repos/${owner}/${repo}`,
+			{
+				headers: { Authorization: `token ${token}` },
+			},
+		).then((r) => r.json())) as { default_branch?: string };
+
+		if (!repoInfo.default_branch) {
+			return c.json({ error: "Repository not found or no access" }, 404);
+		}
+
+		const analysis = await analyzeRepoCode(c.env as any, {
+			token,
+			owner,
+			repo,
+			ref: repoInfo.default_branch,
+		});
+
+		return c.json({ message: "Analysis completed", analysis });
+	} catch (error) {
+		return c.json({ error: "Analysis failed", details: String(error) }, 500);
+	}
+});
+
+/**
+ * GET /research/structured
+ * ------------------------
+ * Returns projects joined with their structured AI analysis as JSON objects.
+ * Query params (all optional):
+ * - binding  (string): filter by wrangler binding (e.g., "d1", "durable_objects")
+ * - kind     (string): filter by repo_kind ("frontend"|"backend"|...)
+ * - min_conf (number): filter by minimum confidence [0..1]
+ */
+app.get("/research/structured", async (c: HonoContext) => {
+	try {
+		const binding = c.req.query("binding");
+		const kind = c.req.query("kind");
+		const minConf = Number(c.req.query("min_conf") ?? "0.0");
+
+		// First check if we have any structured analysis data
+		const structuredCount = await c.env.DB.prepare(
+			"SELECT COUNT(*) as count FROM repo_analysis WHERE structured_json IS NOT NULL",
+		).first();
+		const totalStructured = (structuredCount as { count: number })?.count || 0;
+
+		if (totalStructured === 0) {
+			return c.json({
+				message:
+					"No structured analysis data found. Run structured analyses first with POST /research/analyze-structured",
+				total_structured_analyses: 0,
+				filters: { binding, kind, min_conf: minConf },
+				results: [],
+			});
+		}
+
+		let sql = `
+      SELECT p.full_name, p.html_url, p.stars, a.structured_json
+      FROM projects p
+      JOIN repo_analysis a ON a.repo_full_name = p.full_name
+      WHERE a.structured_json IS NOT NULL
+    `;
+		const args: (string | number)[] = [];
+
+		if (binding) {
+			sql += ` AND EXISTS (
+        SELECT 1 FROM repo_analysis_bindings b
+        WHERE b.repo_full_name = p.full_name AND b.binding = ?
+      )`;
+			args.push(binding);
+		}
+
+		if (kind) {
+			sql += ` AND json_extract(a.structured_json, '$.repo_kind') = ?`;
+			args.push(kind);
+		}
+
+		if (!Number.isNaN(minConf) && minConf > 0) {
+			sql += ` AND json_extract(a.structured_json, '$.confidence') >= ?`;
+			args.push(minConf);
+		}
+
+		sql += ` ORDER BY p.stars DESC, p.updated_at DESC LIMIT 200`;
+
+		const rows = await c.env.DB.prepare(sql)
+			.bind(...args)
+			.all();
+		return c.json({
+			total_structured_analyses: totalStructured,
+			filters: { binding, kind, min_conf: minConf },
+			results: (rows.results || []).map((r: any) => ({
+				full_name: r.full_name,
+				html_url: r.html_url,
+				stars: r.stars,
+				analysis: JSON.parse(r.structured_json || "{}"),
+			})),
+		});
+	} catch (error) {
+		return c.json(
+			{
+				error: "Query failed",
+				details: String(error),
+				results: [],
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * POST /research/analyze-structured
+ * ---------------------------------
+ * Manually run the **structured** code analysis for a specific repo.
+ * Body:
+ * { owner: string, repo: string, force?: boolean=false }
+ * Behavior:
+ * - checks freshness (24h) unless force=true
+ * - loads default branch
+ * - runs analyzeRepoCodeStructured (which returns a strict JSON object)
+ * - stores result in repo_analysis.structured_json (see repo_analyzer module)
+ */
+app.post("/research/analyze-structured", async (c: HonoContext) => {
+	const body = await c.req.json().catch(() => ({}));
+	const { owner, repo, force = false } = body;
+
+	if (!owner || !repo) {
+		return c.json({ error: "owner and repo required" }, 400);
+	}
+
+	try {
+		const installations = await listInstallations(c.env);
+		const installationList = Array.isArray(installations) ? installations : [];
+		if (installationList.length === 0) {
+			return c.json({ error: "No GitHub installations available" }, 400);
+		}
+		const token = await getInstallationToken(c.env, installationList[0].id);
+
+		if (!force) {
+			const existing = await c.env.DB.prepare(
+				"SELECT analyzed_at, structured_json FROM repo_analysis WHERE repo_full_name = ?",
+			)
+				.bind(`${owner}/${repo}`)
+				.first();
+
+			if (existing && (existing as { structured_json: string; analyzed_at: number }).structured_json) {
+				const age = Date.now() - (existing as { analyzed_at: number }).analyzed_at;
+				const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+				if (age < maxAge) {
+					return c.json(
+						{
+							message:
+								"Structured analysis is recent, use force=true to override",
+							analysis: JSON.parse((existing as { structured_json: string }).structured_json),
+						},
+						200,
+					);
+				}
+			}
+		}
+
+		const repoInfo = (await fetch(
+			`https://api.github.com/repos/${owner}/${repo}`,
+			{
+				headers: { Authorization: `token ${token}` },
+			},
+		).then((r) => r.json())) as { default_branch?: string };
+
+		if (!repoInfo.default_branch) {
+			return c.json({ error: "Repository not found or no access" }, 404);
+		}
+
+		const analysis = await analyzeRepoCodeStructured(c.env as any, {
+			token,
+			owner,
+			repo,
+			ref: repoInfo.default_branch,
+		});
+
+		return c.json({ message: "Structured analysis completed", analysis });
+	} catch (error) {
+		return c.json(
+			{ error: "Structured analysis failed", details: String(error) },
+			500,
+		);
+	}
+});
+
+// ===== NEW COLBY API ENDPOINTS =====
+
+/**
+ * POST /api/agent-setup
+ * ---------------------
+ * Generates AI agent configuration files based on project context.
+ *
+ * Request body:
+ * {
+ *   repo?: string,           // GitHub repo (owner/name) - optional if context provided
+ *   context: string,         // Project context and goals
+ *   goals?: string,          // Specific goals and outcomes
+ *   outcomes?: string,       // Expected outcomes
+ *   infrastructure?: string  // Target infrastructure type
+ * }
+ *
+ * Response:
+ * - If API mode: Returns R2 URLs for generated files
+ * - Generates: .agents/AGENT.md, .agents/prompt.md, .agents/PRD.md, .agents/project_tasks.json
+ */
+app.post("/api/agent-setup", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json().catch(() => ({}));
+		const { repo, context, goals, outcomes, infrastructure } = body;
+
+		// Validate required fields
+		if (!context) {
+			return c.json(
+				{
+					error: "Missing required field: context",
+					message:
+						"Please provide project context describing what you want to build",
+				},
+				400,
+			);
+		}
+
+		console.log("[API] Agent setup request:", {
+			repo,
+			hasContext: !!context,
+			goals,
+			infrastructure,
+		});
+
+		// Generate agent assets using the service module
+		const result = await generateAgentAssets(c.env as any, {
+			repo: repo || "api-generated-project",
+			context,
+			goals: goals || "",
+			outcome: outcomes || "",
+		});
+
+		return c.json({
+			message: "Agent assets generated successfully",
+			assets: result,
+			downloadUrls: [], // R2 URLs would be provided by the service
+			metadata: {
+				projectType: "cloudflare-worker", // Default for API requests
+				generatedAt: Date.now(),
+				context: context.substring(0, 100) + "...",
+			},
+		});
+	} catch (err) {
+		console.error("[API] Agent setup error:", err);
+		return c.json(
+			{
+				error: "Failed to generate agent assets",
+				details: err instanceof Error ? err.message : String(err),
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * POST /api/guidance
+ * ------------------
+ * Provides infrastructure-specific guidance and recommendations.
+ *
+ * Request body:
+ * {
+ *   infrastructure: string,  // Infrastructure type (required)
+ *   repo?: string,          // GitHub repo for context analysis
+ *   context?: string,       // Additional project context
+ *   goals?: string          // Project goals and requirements
+ * }
+ */
+app.post("/api/guidance", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json().catch(() => ({}));
+		const { infrastructure, repo, context, goals } = body;
+
+		// Validate required fields
+		if (!infrastructure) {
+			return c.json(
+				{
+					error: "Missing required field: infrastructure",
+					message:
+						"Please specify the infrastructure type you need guidance for",
+					availableTypes: [
+						"cloudflare-workers",
+						"cloudflare-pages",
+						"nextjs-pages",
+						"python",
+						"apps-script",
+						"nodejs",
+						"react",
+						"vue",
+					],
+				},
+				400,
+			);
+		}
+
+		console.log("[API] Infrastructure guidance request:", {
+			infrastructure,
+			repo,
+			hasContext: !!context,
+		});
+
+		// Generate infrastructure guidance
+		const guidance = await generateInfrastructureGuidance(c.env as any, {
+			repo,
+			infraType: infrastructure,
+		});
+
+		return c.json({
+			message: "Infrastructure guidance generated successfully",
+			infrastructure,
+			guidance,
+			generatedAt: Date.now(),
+		});
+	} catch (err) {
+		console.error("[API] Infrastructure guidance error:", err);
+		return c.json(
+			{
+				error: "Failed to generate infrastructure guidance",
+				details: err instanceof Error ? err.message : String(err),
+			},
+			500,
+		);
+	}
+});
+
+/**
+ * POST /api/llm-full
+ * ------------------
+ * Fetches relevant LLM documentation content based on project context.
+ *
+ * Request body:
+ * {
+ *   context?: string,        // Project context for relevance analysis
+ *   repo?: string,          // GitHub repo for analysis
+ *   searchQuery?: string,   // Specific search terms
+ *   goals?: string,         // Project goals
+ *   categories?: string[]   // Specific documentation categories to focus on
+ * }
+ */
+app.post("/api/llm-full", async (c: HonoContext) => {
+	try {
+		const body = await c.req.json().catch(() => ({}));
+		const { context, repo, searchQuery, goals, categories } = body;
+
+		console.log("[API] LLM content request:", {
+			repo,
+			hasContext: !!context,
+			searchQuery,
+			goals,
+			categories,
+		});
+
+		// Create project analysis context
+		const projectContext = {
+			repo: repo || "api-request",
+			repoStructure: {
+				projectType: "cloudflare-worker" as const, // Default assumption for API requests
+				hasWrangler: true,
+				hasNextConfig: false,
+				hasPackageJson: true,
+				hasClaspJson: false,
+				hasAppsScriptJson: false,
+				hasPythonFiles: false,
+				dependencies: [],
+				devDependencies: [],
+			},
+			goals,
+			context,
+			searchQuery,
+		};
+
+		// Fetch relevant LLM content
+		const contentResults = await fetchRelevantLLMContent(
+			c.env as any,
+			projectContext,
+			{
+				forceRefresh: false,
+				includeChunks: true,
+				maxContentLength: 50000,
+			},
+		);
+
+		// Format response with top relevant content
+		const topResults = contentResults.slice(0, 5).map((result) => ({
+			url: result.content.url,
+			category: result.content.category,
+			title: result.content.title,
+			relevanceScore: result.relevanceScore,
+			relevanceReasons: result.relevanceReasons,
+			matchedKeywords: result.matchedKeywords,
+			contentPreview: result.content.content.substring(0, 500) + "...",
+			metadata: result.content.metadata,
+		}));
+
+		return c.json({
+			message: "Relevant LLM content retrieved successfully",
+			totalResults: contentResults.length,
+			topResults,
+			suggestions:
+				contentResults.length === 0
+					? [
+							"Try being more specific about your project type",
+							"Include technology stack details in your context",
+							"Check the available documentation categories",
+						]
+					: [],
+			availableCategories: [
+				"Application Hosting / Full Stack",
+				"AI & Agents",
+				"Edge Compute",
+				"Stateful Services",
+				"Developer Tools & Platform",
+				"Browser/Rendering/Images/Media",
+				"Other/General",
+			],
+			generatedAt: Date.now(),
+		});
+	} catch (err) {
+		console.error("[API] LLM content error:", err);
+		return c.json(
+			{
+				error: "Failed to fetch LLM content",
+				details: err instanceof Error ? err.message : String(err),
+			},
+			500,
+		);
+	}
+});
+
+// ===== COLBY COMMAND ENDPOINTS =====
+
+/**
+ * GET /api/stats
+ * Dashboard statistics endpoint
+ */
+app.get("/api/stats", async (c: HonoContext) => {
+	try {
+		// Get basic counts from the database
+		const [projectsCount, commandsCount, practicesCount, analysisCount] =
+			await Promise.all([
+				c.env.DB.prepare("SELECT COUNT(*) as count FROM projects")
+					.first()
+					.catch(() => ({ count: 0 })),
+				c.env.DB.prepare("SELECT COUNT(*) as count FROM colby_commands")
+					.first()
+					.catch(() => ({ count: 0 })),
+				c.env.DB.prepare("SELECT COUNT(*) as count FROM best_practices")
+					.first()
+					.catch(() => ({ count: 0 })),
+				c.env.DB.prepare("SELECT COUNT(*) as count FROM repo_analysis")
+					.first()
+					.catch(() => ({ count: 0 })),
+			]);
+
+		const html = `
+      <div class="stat-card">
+        <div class="stat-number">${(projectsCount as any)?.count || 0}</div>
+        <div class="stat-label">Projects Tracked</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number">${(commandsCount as any)?.count || 0}</div>
+        <div class="stat-label">Commands Executed</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number">${(practicesCount as any)?.count || 0}</div>
+        <div class="stat-label">Best Practices</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number">${(analysisCount as any)?.count || 0}</div>
+        <div class="stat-label">AI Analyses</div>
+      </div>
+    `;
+
+		return c.html(html);
+	} catch (error) {
+		return c.html('<div class="loading">Error loading stats</div>');
+	}
+});
+
+/**
+ * GET /api/recent-activity
+ * Dashboard recent activity endpoint
+ */
+app.get("/api/recent-activity", async (c: HonoContext) => {
+	try {
+		// Get recent commands (with fallback for missing tables)
+		let recentCommands = { results: [] };
+		try {
+			recentCommands = await c.env.DB.prepare(`
+        SELECT * FROM colby_commands
+        ORDER BY created_at DESC
+        LIMIT 5
+      `).all();
+		} catch (tableError) {
+			// Table doesn't exist, return empty activity
+		}
+
+		const commands = (recentCommands.results || []) as any[];
+
+		if (commands.length === 0) {
+			return c.html('<div class="loading">No recent activity</div>');
+		}
+
+		const html = commands
+			.map((cmd) => {
+				const timeAgo = new Date(cmd.created_at).toLocaleString();
+				return `
+        <div class="operation-item">
+          <div class="operation-info">
+            <h4>/colby ${cmd.command}</h4>
+            <div class="operation-meta">
+              <strong>${cmd.repo}</strong> • by @${cmd.author} • ${timeAgo}
+            </div>
+          </div>
+          <span class="status ${cmd.status}">${cmd.status}</span>
+        </div>
+      `;
+			})
+			.join("");
+
+		return c.html(html);
+	} catch (error) {
+		return c.html('<div class="loading">Error loading recent activity</div>');
+	}
+});
+
+
+/**
+ * GET /colby/operations/:id
+ * Get real-time operation progress
+ */
+app.get("/colby/operations/:id", async (c: HonoContext) => {
+	const operationId = c.req.param("id");
+
+	try {
+		// Try to create the operation_progress table if it doesn't exist
+		try {
+			await c.env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS operation_progress (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation_id TEXT NOT NULL UNIQUE,
+          operation_type TEXT NOT NULL,
+          repo TEXT NOT NULL,
+          pr_number INTEGER,
+          status TEXT NOT NULL DEFAULT 'started',
+          progress_percent INTEGER DEFAULT 0,
+          current_step TEXT,
+          steps_total INTEGER DEFAULT 1,
+          steps_completed INTEGER DEFAULT 0,
+          result_data TEXT,
+          error_message TEXT,
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
+        )
+      `).run();
+		} catch {
+			// Table might already exist, continue
+      console.log("Operation progress table creation attempted.");
+		}
+
+		const operation = await c.env.DB.prepare(
+			"SELECT * FROM operation_progress WHERE operation_id = ?",
+		)
+			.bind(operationId)
+			.first();
+
+		if (!operation) {
+			return c.json({ error: "Operation not found" }, 404);
+		}
+
+		return c.json({
+			id: operation.operation_id,
+			type: operation.operation_type,
+			repo: operation.repo,
+			prNumber: operation.pr_number,
+			status: operation.status,
+			progress: operation.progress_percent,
+			currentStep: operation.current_step,
+			stepsTotal: operation.steps_total,
+			stepsCompleted: operation.steps_completed,
+			result: operation.result_data
+				? JSON.parse(operation.result_data as string)
+				: null,
+			error: operation.error_message,
+			createdAt: operation.created_at,
+			updatedAt: operation.updated_at,
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch operation" }, 500);
+	}
+});
+
+/**
+ * GET /colby/commands
+ * List colby commands with filtering
+ */
+app.get("/colby/commands", async (c: HonoContext) => {
+	const repo = c.req.query("repo");
+	const author = c.req.query("author");
+	const status = c.req.query("status");
+	const command = c.req.query("command");
+
+	// Safe parameter parsing with validation
+	const limitParam = c.req.query("limit");
+	const offsetParam = c.req.query("offset");
+
+	// Parse and validate limit parameter
+	let limit = 50; // default
+	if (limitParam) {
+		const parsedLimit = Number(limitParam);
+		if (Number.isNaN(parsedLimit) || parsedLimit < 1) {
+			return c.json(
+				{ error: "Invalid limit parameter. Must be a positive number." },
+				400,
+			);
+		}
+		limit = Math.min(parsedLimit, 200);
+	}
+
+	// Parse and validate offset parameter
+	let offset = 0; // default
+	if (offsetParam) {
+		const parsedOffset = Number(offsetParam);
+		if (Number.isNaN(parsedOffset) || parsedOffset < 0) {
+			return c.json(
+				{ error: "Invalid offset parameter. Must be a non-negative number." },
+				400,
+			);
+		}
+		offset = parsedOffset;
+	}
+
+	try {
+		// Try to create the colby_commands table if it doesn't exist
+		try {
+			await c.env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS colby_commands (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          delivery_id TEXT NOT NULL,
+          repo TEXT NOT NULL,
+          pr_number INTEGER,
+          author TEXT NOT NULL,
+          command TEXT NOT NULL,
+          command_args TEXT,
+          status TEXT NOT NULL DEFAULT 'queued',
+          prompt_generated TEXT,
+          result_data TEXT,
+          error_message TEXT,
+          started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+          completed_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
+        )
+      `).run();
+		} catch (createError) {
+			// Table might already exist, continue
+		}
+
+		// First check if the colby_commands table exists
+		try {
+			await c.env.DB.prepare("SELECT 1 FROM colby_commands LIMIT 1").all();
+		} catch (tableError) {
+			// Table doesn't exist, try to create it
+			try {
+				await c.env.DB.prepare(`
+          CREATE TABLE colby_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_id TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            pr_number INTEGER,
+            author TEXT NOT NULL,
+            command TEXT NOT NULL,
+            command_args TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            prompt_generated TEXT,
+            result_data TEXT,
+            error_message TEXT,
+            started_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+            completed_at INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
+          )
+        `).run();
+			} catch (createError) {
+				// Return helpful message
+				return c.json(
+					{
+						error: "Database setup incomplete",
+						message: "Run: wrangler d1 migrations apply gh-bot --remote",
+						commands: [],
+						pagination: { limit, offset },
+					},
+					200,
+				);
+			}
+		}
+
+		let sql = "SELECT * FROM colby_commands WHERE 1=1";
+		const params: any[] = [];
+
+		if (repo) {
+			sql += " AND repo = ?";
+			params.push(repo);
+		}
+		if (author) {
+			sql += " AND author = ?";
+			params.push(author);
+		}
+		if (status) {
+			sql += " AND status = ?";
+			params.push(status);
+		}
+		if (command) {
+			sql += " AND command = ?";
+			params.push(command);
+		}
+
+		sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+		params.push(limit, offset);
+
+		const commands = await c.env.DB.prepare(sql)
+			.bind(...params)
+			.all();
+
+		// Check if this is a request for HTML (from dashboard)
+		const acceptHeader = c.req.header("Accept") || "";
+		const isHTMLRequest =
+			acceptHeader.includes("text/html") || c.req.header("HX-Request");
+
+		if (isHTMLRequest) {
+			if (!commands.results || commands.results.length === 0) {
+				return c.html('<div class="loading">No commands found</div>');
+			}
+
+			const html = (commands.results as any[])
+				.map((cmd) => {
+					const timeAgo = new Date(cmd.created_at).toLocaleString();
+					const statusClass = cmd.status;
+					const args = cmd.command_args ? JSON.parse(cmd.command_args) : {};
+
+					return `
+          <div class="command-item">
+            <h4>/colby ${cmd.command}</h4>
+            <div class="operation-meta">
+              <strong>${cmd.repo}</strong> • by @${cmd.author} • ${timeAgo}
+              ${cmd.pr_number ? ` • PR #${cmd.pr_number}` : ""}
+            </div>
+            <div style="margin-top: 5px;">
+              <span class="status ${statusClass}">${cmd.status}</span>
+              ${cmd.error_message ? `<span style="color: #721c24; margin-left: 10px;">${cmd.error_message}</span>` : ""}
+            </div>
+          </div>
+        `;
+				})
+				.join("");
+
+			return c.html(html);
+		}
+
+		return c.json({
+			commands: (commands.results || []).map((cmd: any) => ({
+				id: cmd.id,
+				deliveryId: cmd.delivery_id,
+				repo: cmd.repo,
+				prNumber: cmd.pr_number,
+				author: cmd.author,
+				command: cmd.command,
+				commandArgs: cmd.command_args ? JSON.parse(cmd.command_args) : null,
+				status: cmd.status,
+				promptGenerated: cmd.prompt_generated,
+				resultData: cmd.result_data ? JSON.parse(cmd.result_data) : null,
+				errorMessage: cmd.error_message,
+				startedAt: cmd.started_at,
+				completedAt: cmd.completed_at,
+				createdAt: cmd.created_at,
+			})),
+			pagination: { limit, offset },
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch commands" }, 500);
+	}
+});
+
+/**
+ * GET /colby/best-practices
+ * List bookmarked best practices
+ */
+app.get("/colby/best-practices", async (c: HonoContext) => {
+	const category = c.req.query("category");
+	const subcategory = c.req.query("subcategory");
+	const status = c.req.query("status") || "pending";
+
+	// Safe parameter parsing with validation
+	const limitParam = c.req.query("limit");
+	const offsetParam = c.req.query("offset");
+
+	// Parse and validate limit parameter
+	let limit = 50; // default
+	if (limitParam) {
+		const parsedLimit = Number(limitParam);
+		if (isNaN(parsedLimit) || parsedLimit < 1) {
+			return c.json(
+				{ error: "Invalid limit parameter. Must be a positive number." },
+				400,
+			);
+		}
+		limit = Math.min(parsedLimit, 200);
+	}
+
+	// Parse and validate offset parameter
+	let offset = 0; // default
+	if (offsetParam) {
+		const parsedOffset = Number(offsetParam);
+		if (isNaN(parsedOffset) || parsedOffset < 0) {
+			return c.json(
+				{ error: "Invalid offset parameter. Must be a non-negative number." },
+				400,
+			);
+		}
+		offset = parsedOffset;
+	}
+
+	try {
+		// Try to create the best_practices table if it doesn't exist
+		try {
+			await c.env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS best_practices (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          suggestion_text TEXT NOT NULL,
+          context_repo TEXT NOT NULL,
+          context_pr INTEGER,
+          context_file TEXT,
+          ai_tags TEXT,
+          category TEXT,
+          subcategory TEXT,
+          confidence REAL DEFAULT 0.5,
+          status TEXT DEFAULT 'pending',
+          bookmarked_by TEXT NOT NULL,
+          votes_up INTEGER DEFAULT 0,
+          votes_down INTEGER DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+          updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
+        )
+      `).run();
+		} catch (createError) {
+			// Table might already exist, continue
+		}
+
+		// First check if the best_practices table exists
+		try {
+			await c.env.DB.prepare("SELECT 1 FROM best_practices LIMIT 1").all();
+		} catch (tableError) {
+			// Table doesn't exist, try to create it
+			try {
+				await c.env.DB.prepare(`
+          CREATE TABLE best_practices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suggestion_text TEXT NOT NULL,
+            context_repo TEXT NOT NULL,
+            context_pr INTEGER,
+            context_file TEXT,
+            ai_tags TEXT,
+            category TEXT,
+            subcategory TEXT,
+            confidence REAL DEFAULT 0.5,
+            status TEXT DEFAULT 'pending',
+            bookmarked_by TEXT NOT NULL,
+            votes_up INTEGER DEFAULT 0,
+            votes_down INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000)
+          )
+        `).run();
+			} catch (createError) {
+				return c.json(
+					{
+						error: "Database setup incomplete",
+						message: "Run: wrangler d1 migrations apply gh-bot --remote",
+						practices: [],
+						pagination: { limit, offset },
+					},
+					200,
+				);
+			}
+		}
+		let sql = "SELECT * FROM best_practices WHERE status = ?";
+		const params: any[] = [status];
+
+		if (category) {
+			sql += " AND category = ?";
+			params.push(category);
+		}
+		if (subcategory) {
+			sql += " AND subcategory = ?";
+			params.push(subcategory);
+		}
+
+		sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+		params.push(limit, offset);
+
+		const practices = await c.env.DB.prepare(sql)
+			.bind(...params)
+			.all();
+
+		// Check if this is a request for HTML (from dashboard)
+		const acceptHeader = c.req.header("Accept") || "";
+		const isHTMLRequest =
+			acceptHeader.includes("text/html") || c.req.header("HX-Request");
+
+		if (isHTMLRequest) {
+			if (!practices.results || practices.results.length === 0) {
+				return c.html('<div class="loading">No best practices found</div>');
+			}
+
+			const html = (practices.results as any[])
+				.map((p) => {
+					const tags = p.ai_tags ? JSON.parse(p.ai_tags) : [];
+					const timeAgo = new Date(p.created_at).toLocaleString();
+
+					return `
+          <div class="practice-item">
+            <div style="font-weight: 600; margin-bottom: 10px;">${p.category} → ${p.subcategory}</div>
+            <div style="margin-bottom: 10px;">${p.suggestion_text}</div>
+            <div class="operation-meta">
+              From <strong>${p.context_repo}</strong>${p.context_pr ? ` PR #${p.context_pr}` : ""} •
+              by @${p.bookmarked_by} • ${timeAgo}
+            </div>
+            <div class="tags">
+              ${tags.map((tag: string) => `<span class="tag">${tag}</span>`).join("")}
+            </div>
+          </div>
+        `;
+				})
+				.join("");
+
+			return c.html(html);
+		}
+
+		return c.json({
+			practices: (practices.results || []).map((p: any) => ({
+				id: p.id,
+				suggestionText: p.suggestion_text,
+				contextRepo: p.context_repo,
+				contextPr: p.context_pr,
+				contextFile: p.context_file,
+				tags: p.ai_tags ? JSON.parse(p.ai_tags) : [],
+				category: p.category,
+				subcategory: p.subcategory,
+				confidence: p.confidence,
+				status: p.status,
+				bookmarkedBy: p.bookmarked_by,
+				votesUp: p.votes_up,
+				votesDown: p.votes_down,
+				createdAt: p.created_at,
+				updatedAt: p.updated_at,
+			})),
+			pagination: { limit, offset },
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch best practices" }, 500);
+	}
+});
+
+/**
+ * GET /colby/repo/:owner/:repo
+ * Get repo-specific colby activity
+ */
+app.get("/colby/repo/:owner/:repo", async (c: HonoContext) => {
+	const owner = c.req.param("owner");
+	const repo = c.req.param("repo");
+	const repoFullName = `${owner}/${repo}`;
+
+	try {
+		// Get recent commands (with fallback)
+		let commands = { results: [] };
+		try {
+			commands = await c.env.DB.prepare(`
+        SELECT * FROM colby_commands
+        WHERE repo = ?
+        ORDER BY created_at DESC
+        LIMIT 20
+      `)
+				.bind(repoFullName)
+				.all();
+		} catch (error) {
+			// Table might not exist, continue with empty results
+		}
+
+		// Get best practices from this repo (with fallback)
+		let practices = { results: [] };
+		try {
+			practices = await c.env.DB.prepare(`
+        SELECT * FROM best_practices
+        WHERE context_repo = ?
+        ORDER BY created_at DESC
+        LIMIT 20
+      `)
+				.bind(repoFullName)
+				.all();
+		} catch (error) {
+			// Table might not exist, continue with empty results
+		}
+
+		// Get created issues (with fallback)
+		let issues = { results: [] };
+		try {
+			issues = await c.env.DB.prepare(`
+        SELECT * FROM colby_issues
+        WHERE repo = ?
+        ORDER BY created_at DESC
+        LIMIT 20
+      `)
+				.bind(repoFullName)
+				.all();
+		} catch (error) {
+			// Table might not exist, continue with empty results
+		}
+
+		return c.json({
+			repo: repoFullName,
+			commands: commands.results || [],
+			bestPractices: practices.results || [],
+			issues: issues.results || [],
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch repo data" }, 500);
+	}
+});
+
+/**
+ * GET /api/repo/:owner/:repo/analysis
+ * Get detailed AI analysis for a repository
+ */
+app.get("/api/repo/:owner/:repo/analysis", async (c: HonoContext) => {
+	const owner = c.req.param("owner");
+	const repo = c.req.param("repo");
+	const repoFullName = `${owner}/${repo}`;
+
+	try {
+		// Get repo data from database
+		const repoData = await c.env.DB.prepare(`
+			SELECT * FROM projects WHERE full_name = ?
+		`).bind(repoFullName).first();
+
+		if (!repoData) {
+			return c.json({ error: "Repository not found" }, 404);
+		}
+
+		// Detect badges
+		const badgeResult = await detectRepoBadges(repoData);
+		
+		// Get AI analysis
+		const aiAnalyzer = new AIRepoAnalyzer(c.env.AI);
+		const analysis = await aiAnalyzer.analyzeRepository(repoData, badgeResult.badges);
+		
+		// Generate action commands
+		const commands = await aiAnalyzer.generateActionCommands(repoData, analysis);
+
+		return c.json({
+			repo: repoFullName,
+			analysis,
+			badges: badgeResult.badges,
+			commands,
+			timestamp: Date.now()
+		});
+	} catch (error) {
+		console.error('Error analyzing repository:', error);
+		return c.json({ error: "Failed to analyze repository" }, 500);
+	}
+});
+
+/**
+ * POST /api/repo/:owner/:repo/feedback
+ * Record user feedback for a repository
+ */
+app.post("/api/repo/:owner/:repo/feedback", async (c: HonoContext) => {
+	const owner = c.req.param("owner");
+	const repo = c.req.param("repo");
+	const repoFullName = `${owner}/${repo}`;
+	
+	try {
+		const body = await c.req.json();
+		const { feedback, reasoning } = body;
+		
+		if (!feedback || !['like', 'dislike'].includes(feedback)) {
+			return c.json({ error: "Invalid feedback type" }, 400);
+		}
+
+		const userPrefs = new UserPreferencesManager(c.env.USER_PREFERENCES);
+		await userPrefs.recordRepoFeedback('default-user', repoFullName, feedback, reasoning);
+
+		return c.json({ success: true });
+	} catch (error) {
+		console.error('Error recording feedback:', error);
+		return c.json({ error: "Failed to record feedback" }, 500);
+	}
+});
+
+/**
+ * GET /openapi.json
+ * OpenAPI 3.1.0 specification for custom GPT actions
+ * Returns the comprehensive API specification
+ */
+app.get("/openapi.json", async (c: HonoContext) => {
+	// Import OpenAPI specification directly since Cloudflare Workers can't read files
+	const spec = {
+		openapi: "3.1.0",
+		info: {
+			title: "Colby GitHub Bot API",
+			description:
+				"AI-powered GitHub workflow automation, code analysis, and repository research platform. This API enables programmatic access to repository analysis, command execution tracking, best practices management, and research orchestration capabilities.",
+			version: "1.0.0",
+			contact: {
+				name: "Colby GitHub Bot",
+				url: "https://github.com",
+			},
+			license: {
+				name: "MIT",
+			},
+		},
+		servers: [
+			{
+				url: "https://gh-bot.hacolby.workers.dev",
+				description: "Production server",
+			},
+			{
+				url: "http://localhost:8787",
+				description: "Local development server",
+			},
+		],
+		tags: [
+			{ name: "Health", description: "System health and status endpoints" },
+			{
+				name: "Research",
+				description: "Repository research and analysis operations",
+			},
+			{
+				name: "Colby Commands",
+				description: "GitHub bot command tracking and management",
+			},
+			{
+				name: "Best Practices",
+				description: "Code best practices and suggestions management",
+			},
+			{
+				name: "Operations",
+				description: "Live operation tracking and progress monitoring",
+			},
+			{ name: "Dashboard", description: "Web dashboard and UI endpoints" },
+		],
+		paths: {
+			"/health": {
+				get: {
+					tags: ["Health"],
+					summary: "Health check",
+					description:
+						"Lightweight liveness probe for uptime monitoring and CI smoke tests",
+					operationId: "getHealth",
+					responses: {
+						"200": {
+							description: "Service is healthy",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											ok: { type: "boolean", example: true },
+										},
+										required: ["ok"],
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"/research/results": {
+				get: {
+					tags: ["Research"],
+					summary: "Get research results",
+					description:
+						"Retrieve analyzed repositories with AI summaries, ranked by score and analysis confidence",
+					operationId: "getResearchResults",
+					parameters: [
+						{
+							name: "min_score",
+							in: "query",
+							description: "Minimum project score threshold (0.0 to 1.0)",
+							schema: { type: "number", minimum: 0, maximum: 1, default: 0.6 },
+						},
+						{
+							name: "limit",
+							in: "query",
+							description: "Maximum number of results to return",
+							schema: {
+								type: "integer",
+								minimum: 1,
+								maximum: 200,
+								default: 50,
+							},
+						},
+					],
+					responses: {
+						"200": {
+							description: "Research results",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											total_projects: { type: "integer" },
+											min_score_filter: { type: "number" },
+											limit_applied: { type: "integer" },
+											results: {
+												type: "array",
+												items: {
+													type: "object",
+													properties: {
+														full_name: {
+															type: "string",
+															example: "cloudflare/workers-sdk",
+														},
+														html_url: { type: "string", format: "uri" },
+														stars: { type: "integer", minimum: 0 },
+														score: { type: "number", minimum: 0, maximum: 1 },
+														short_summary: { type: "string", nullable: true },
+														long_summary: { type: "string", nullable: true },
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"/colby/commands": {
+				get: {
+					tags: ["Colby Commands"],
+					summary: "List colby commands",
+					description:
+						"Get history of colby command executions with filtering options",
+					operationId: "getColbyCommands",
+					parameters: [
+						{
+							name: "repo",
+							in: "query",
+							schema: { type: "string" },
+							description: "Filter by repository",
+						},
+						{
+							name: "author",
+							in: "query",
+							schema: { type: "string" },
+							description: "Filter by author",
+						},
+						{
+							name: "status",
+							in: "query",
+							schema: {
+								type: "string",
+								enum: ["queued", "working", "completed", "failed"],
+							},
+						},
+						{
+							name: "limit",
+							in: "query",
+							schema: {
+								type: "integer",
+								minimum: 1,
+								maximum: 200,
+								default: 50,
+							},
+						},
+					],
+					responses: {
+						"200": {
+							description: "Command history",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											commands: {
+												type: "array",
+												items: {
+													type: "object",
+													properties: {
+														id: { type: "string" },
+														repo: { type: "string" },
+														author: { type: "string" },
+														command: { type: "string" },
+														status: {
+															type: "string",
+															enum: [
+																"queued",
+																"working",
+																"completed",
+																"failed",
+															],
+														},
+														createdAt: { type: "integer" },
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"/colby/best-practices": {
+				get: {
+					tags: ["Best Practices"],
+					summary: "Get best practices",
+					description:
+						"Retrieve bookmarked code suggestions and best practices",
+					operationId: "getBestPractices",
+					parameters: [
+						{ name: "category", in: "query", schema: { type: "string" } },
+						{
+							name: "status",
+							in: "query",
+							schema: {
+								type: "string",
+								enum: ["pending", "approved", "rejected"],
+								default: "pending",
+							},
+						},
+					],
+					responses: {
+						"200": { description: "Best practices list" },
+					},
+				},
+			},
+		},
+	};
+
+	return c.json(spec);
+});
+
+/**
+ * GET /
+ * Main dashboard UI
+ */
+app.get("/", async (c: HonoContext) => {
+	// Serve the static HTML file
+	const url = new URL(c.req.url);
+	url.pathname = "/html/dashboard.html";
+	return c.env.ASSETS.fetch(new Request(url.toString()));
+});
+
+// ===== DASHBOARD API ENDPOINTS =====
+
+/**
+ * GET /api/stats
+ * Dashboard statistics
+ */
+app.get("/api/stats", async (c: HonoContext) => {
+	try {
+		const stats = await Promise.all([
+			c.env.DB.prepare("SELECT COUNT(*) as count FROM colby_commands").first(),
+			c.env.DB.prepare(
+				'SELECT COUNT(*) as count FROM colby_commands WHERE status = "working"',
+			).first(),
+			c.env.DB.prepare("SELECT COUNT(*) as count FROM best_practices").first(),
+			c.env.DB.prepare("SELECT COUNT(*) as count FROM projects").first(),
+		]);
+
+		return c.html(`
+      <div class="stat-card">
+        <div class="stat-number">${stats[0]?.count || 0}</div>
+        <div class="stat-label">Total Commands</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number">${stats[1]?.count || 0}</div>
+        <div class="stat-label">Active Operations</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number">${stats[2]?.count || 0}</div>
+        <div class="stat-label">Best Practices</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number">${stats[3]?.count || 0}</div>
+        <div class="stat-label">Analyzed Repos</div>
+      </div>
+    `);
+	} catch (error) {
+		return c.html('<div class="stat-card">Error loading stats</div>');
+	}
+});
+
+/**
+ * GET /api/recent-activity
+ * Recent colby activity
+ */
+app.get("/api/recent-activity", async (c: HonoContext) => {
+	try {
+		const recent = await c.env.DB.prepare(`
+      SELECT * FROM colby_commands
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).all();
+
+		if (!recent.results || recent.results.length === 0) {
+			return c.html('<div class="loading">No recent activity</div>');
+		}
+
+		const html = (recent.results as any[])
+			.map((cmd) => {
+				const timeAgo = new Date(cmd.created_at).toLocaleString();
+				const statusClass = cmd.status;
+				return `
+        <div class="operation-item">
+          <div class="operation-info">
+            <h4>/${cmd.command}</h4>
+            <div class="operation-meta">
+              ${cmd.repo} • by @${cmd.author} • ${timeAgo}
+            </div>
+          </div>
+          <div class="status ${statusClass}">${cmd.status}</div>
+        </div>
+      `;
+			})
+			.join("");
+
+		return c.html(html);
+	} catch (error) {
+		return c.html('<div class="loading">Error loading activity</div>');
+	}
+});
+
+/**
+ * GET /api/operations
+ * Live operations for dashboard
+ */
+app.get("/api/operations", async (c: HonoContext) => {
+	try {
+		// First, try to create the table if it doesn't exist
+		try {
+			await c.env.DB.prepare(`
+        CREATE TABLE IF NOT EXISTS operation_progress (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation_id TEXT NOT NULL UNIQUE,
+          operation_type TEXT NOT NULL,
+          repo TEXT NOT NULL,
+          pr_number INTEGER,
+          status TEXT NOT NULL DEFAULT 'started',
+          current_step TEXT,
+          progress_percent INTEGER DEFAULT 0,
+          steps_total INTEGER,
+          steps_completed INTEGER,
+          error_message TEXT,
+          result_data TEXT,
+          created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+          updated_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+        )
+      `).run();
+		} catch (createError) {
+			console.log("Operation progress table creation attempted:", createError);
+		}
+
+		// Get recent operations (last 24 hours) with more inclusive status filtering
+		const operations = await c.env.DB.prepare(`
+      SELECT * FROM operation_progress
+      WHERE (status IN ('started', 'progress', 'queued') OR updated_at > ?)
+      ORDER BY created_at DESC
+      LIMIT 20
+    `)
+			.bind(Date.now() - 24 * 60 * 60 * 1000)
+			.all();
+
+		if (!operations.results || operations.results.length === 0) {
+			return c.html(`
+        <div class="no-operations">
+          <div style="text-align: center; padding: 40px; color: #586069;">
+            <h3>No Active Operations</h3>
+            <p>Operations will appear here when you use Colby commands in GitHub PRs or issues.</p>
+            <p>Try using <code>/colby help</code> in a PR comment to get started!</p>
+          </div>
+        </div>
+      `);
+		}
+
+		const html = (operations.results as any[])
+			.map((op) => {
+				const progress = op.progress_percent || 0;
+				const statusClass =
+					op.status === "started" || op.status === "progress" || op.status === "queued"
+						? "working"
+						: op.status === "completed"
+							? "completed"
+							: op.status === "failed"
+								? "failed"
+								: "queued";
+
+				const timeAgo = op.updated_at ? 
+					Math.round((Date.now() - op.updated_at) / 1000) : 0;
+				const timeText = timeAgo < 60 ? `${timeAgo}s ago` : 
+					timeAgo < 3600 ? `${Math.round(timeAgo / 60)}m ago` : 
+					`${Math.round(timeAgo / 3600)}h ago`;
+
+				return `
+        <div class="operation-item" onclick="showOperationDetail('${op.operation_id}')" style="cursor: pointer;">
+          <div class="operation-info">
+            <h4>${op.operation_type || 'Unknown Operation'}</h4>
+            <div class="operation-meta">
+              ${op.repo || 'Unknown Repo'}${op.pr_number ? ` • PR #${op.pr_number}` : ''} • ${op.current_step || "Initializing..."}
+              <span style="color: #586069; font-size: 12px; margin-left: 10px;">${timeText}</span>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${progress}%"></div>
+            </div>
+            <div class="status ${statusClass}">${op.status}</div>
+          </div>
+        </div>
+      `;
+			})
+			.join("");
+
+		return c.html(html);
+	} catch (error) {
+		console.error("Error fetching operations:", error);
+		return c.html(`
+      <div class="error">
+        <h3>Error Loading Operations</h3>
+        <p>Failed to load operations: ${error instanceof Error ? error.message : String(error)}</p>
+        <p>Check the console for more details.</p>
+      </div>
+    `);
+	}
+});
+
+/**
+ * GET /api/operations/:id
+ * Get detailed information about a specific operation
+ */
+app.get("/api/operations/:id", async (c: HonoContext) => {
+	try {
+		const operationId = c.req.param('id');
+		
+		const operation = await c.env.DB.prepare(`
+			SELECT * FROM operation_progress 
+			WHERE operation_id = ?
+		`).bind(operationId).first();
+
+		if (!operation) {
+			return c.json({ error: 'Operation not found' }, 404);
+		}
+
+		return c.json(operation);
+	} catch (error) {
+		console.error("Error fetching operation details:", error);
+		return c.json({ error: 'Failed to fetch operation details' }, 500);
+	}
+});
+
+/**
+ * GET /api/operations/:id/logs
+ * Get logs for a specific operation
+ */
+app.get("/api/operations/:id/logs", async (c: HonoContext) => {
+	try {
+		const operationId = c.req.param('id');
+		const limit = parseInt(c.req.query('limit') || '100');
+		
+		const logs = await c.env.DB.prepare(`
+			SELECT operation_id, log_level, message, details, timestamp
+			FROM operation_logs
+			WHERE operation_id = ?
+			ORDER BY timestamp DESC
+			LIMIT ?
+		`).bind(operationId, limit).all();
+
+		const formattedLogs = (logs.results as any[]).map(row => ({
+			operationId: row.operation_id,
+			level: row.log_level,
+			message: row.message,
+			details: row.details ? JSON.parse(row.details) : undefined,
+			timestamp: row.timestamp,
+			timeAgo: Math.round((Date.now() - row.timestamp) / 1000)
+		}));
+
+		return c.json({ logs: formattedLogs });
+	} catch (error) {
+		console.error("Error fetching operation logs:", error);
+		return c.json({ error: 'Failed to fetch operation logs' }, 500);
+	}
+});

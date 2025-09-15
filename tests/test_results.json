@@ -1,0 +1,454 @@
+{
+  "url": "https://gh-bot.hacolby.workers.dev",
+  "timestamp": "2025-08-15T03:33:50.875986",
+  "results": [
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.09354901313781738,
+      "message": "Response time: 0.09s"
+    },
+    {
+      "endpoint": "/demo/stream",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.6370258331298828,
+      "message": "Response time: 0.64s"
+    },
+    {
+      "endpoint": "/research/status",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.05207395553588867,
+      "message": "Response time: 0.05s"
+    },
+    {
+      "endpoint": "/research/results",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.07222890853881836,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/research/results?min_score=0.7&limit=10",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06254696846008301,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/research/risks",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06442499160766602,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/research/structured",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06065201759338379,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/research/structured?kind=backend&min_conf=0.5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.07138705253601074,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/research/analysis",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.035843849182128906,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/analysis?repo=cloudflare/workers-sdk",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06601476669311523,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/research/run",
+      "method": "POST",
+      "status": "PASSED",
+      "response_code": 202,
+      "response_time": 0.0656898021697998,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/research/analyze",
+      "method": "POST",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.20186996459960938,
+      "message": "Response time: 0.20s"
+    },
+    {
+      "endpoint": "/research/analyze-structured",
+      "method": "POST",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.1874539852142334,
+      "message": "Response time: 0.19s"
+    },
+    {
+      "endpoint": "/research/analyze",
+      "method": "POST",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.03139925003051758,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/colby/commands",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.06331801414489746,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/colby/commands?limit=5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.07091689109802246,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/commands?repo=test/repo&author=testuser",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.0651540756225586,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/commands?limit=wat",
+      "method": "GET",
+      "status": "FAILED",
+      "response_code": 500,
+      "response_time": 0.06950998306274414,
+      "message": "Expected [400], got 500"
+    },
+    {
+      "endpoint": "/colby/best-practices",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.06675314903259277,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/best-practices?category=typescript&status=pending",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.07307219505310059,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/best-practices?limit=invalid",
+      "method": "GET",
+      "status": "FAILED",
+      "response_code": 500,
+      "response_time": 0.06606197357177734,
+      "message": "Expected [400], got 500"
+    },
+    {
+      "endpoint": "/colby/operations/test-operation-123",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.07498717308044434,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/repo/cloudflare/workers-sdk",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.06395125389099121,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.03971695899963379,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/help",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.0367588996887207,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/openapi.json",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.04693603515625,
+      "message": "Response time: 0.05s"
+    },
+    {
+      "endpoint": "/api/stats",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.090576171875,
+      "message": "Response time: 0.09s"
+    },
+    {
+      "endpoint": "/api/recent-activity",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06525301933288574,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/api/operations",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06158900260925293,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/research/results?limit=5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06107306480407715,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/colby/commands?limit=5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.06460118293762207,
+      "message": "Response time: 0.06s"
+    },
+    {
+      "endpoint": "/research/results?min_score=invalid",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.038417816162109375,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/results?limit=0",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.039788007736206055,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/results?limit=-5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.041368961334228516,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/structured?min_conf=2.0",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06583094596862793,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/research/structured?min_conf=-0.5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.09796881675720215,
+      "message": "Response time: 0.10s"
+    },
+    {
+      "endpoint": "/colby/commands?offset=-1",
+      "method": "GET",
+      "status": "FAILED",
+      "response_code": 500,
+      "response_time": 0.06534504890441895,
+      "message": "Expected [400, 200], got 500"
+    },
+    {
+      "endpoint": "/colby/best-practices?limit=abc",
+      "method": "GET",
+      "status": "FAILED",
+      "response_code": 500,
+      "response_time": 0.06829524040222168,
+      "message": "Expected [400, 200], got 500"
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.034085988998413086,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.03647303581237793,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.0340418815612793,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.03292489051818848,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.03725600242614746,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/analysis?repo='; DROP TABLE colby_commands; --",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.04026079177856445,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/analysis?repo=test' OR '1'='1",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.03171586990356445,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/research/analysis?repo=test'; INSERT INTO colby_commands VALUES (...); --",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.03316307067871094,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/research/analysis?repo=test\"; DELETE FROM best_practices; --",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.033924102783203125,
+      "message": "Response time: 0.03s"
+    },
+    {
+      "endpoint": "/colby/commands?repo=<script>alert('xss')</script>",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.07034802436828613,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/commands?repo=javascript:alert('xss')",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.06564211845397949,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/colby/commands?repo=%3Cscript%3Ealert('xss')%3C/script%3E",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 500,
+      "response_time": 0.06530308723449707,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/github/webhook",
+      "method": "POST",
+      "status": "PASSED",
+      "response_code": 401,
+      "response_time": 0.04019427299499512,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/github/webhook",
+      "method": "POST",
+      "status": "PASSED",
+      "response_code": 401,
+      "response_time": 0.03511500358581543,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/non-existent-endpoint",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 404,
+      "response_time": 0.03551006317138672,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/nope/commands?limit=5",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 404,
+      "response_time": 0.03765296936035156,
+      "message": "Response time: 0.04s"
+    },
+    {
+      "endpoint": "/research/results?limit=9999",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 200,
+      "response_time": 0.06507110595703125,
+      "message": "Response time: 0.07s"
+    },
+    {
+      "endpoint": "/research/analysis?repo='; DROP TABLE projects; --",
+      "method": "GET",
+      "status": "PASSED",
+      "response_code": 400,
+      "response_time": 0.041683197021484375,
+      "message": "Response time: 0.04s"
+    }
+  ]
+}

@@ -1,0 +1,1125 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Colby GitHub Bot API",
+    "description": "AI-powered GitHub workflow automation, code analysis, and repository research platform. This API enables programmatic access to repository analysis, command execution tracking, best practices management, and research orchestration capabilities.",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Colby GitHub Bot",
+      "url": "https://github.com"
+    },
+    "license": {
+      "name": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://gh-bot.hacolby.workers.dev",
+      "description": "Production server"
+    },
+    {
+      "url": "http://localhost:8787",
+      "description": "Local development server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "System health and status endpoints"
+    },
+    {
+      "name": "Research",
+      "description": "Repository research and analysis operations"
+    },
+    {
+      "name": "Colby Commands",
+      "description": "GitHub bot command tracking and management"
+    },
+    {
+      "name": "Best Practices",
+      "description": "Code best practices and suggestions management"
+    },
+    {
+      "name": "Operations",
+      "description": "Live operation tracking and progress monitoring"
+    },
+    {
+      "name": "Dashboard",
+      "description": "Web dashboard and UI endpoints"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Health check",
+        "description": "Lightweight liveness probe for uptime monitoring and CI smoke tests",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "example": true
+                    }
+                  },
+                  "required": ["ok"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/research/run": {
+      "post": {
+        "tags": ["Research"],
+        "summary": "Start research sweep",
+        "description": "Initiates a research sweep via the ResearchOrchestrator Durable Object",
+        "operationId": "runResearch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "queries": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Explicit search queries to run"
+                  },
+                  "categories": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Load active queries from D1 for these categories"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Research sweep initiated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": ["started", "queued"]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Research orchestrator not available"
+          }
+        }
+      }
+    },
+    "/research/status": {
+      "get": {
+        "tags": ["Research"],
+        "summary": "Get research status",
+        "description": "Returns the current status of the ResearchOrchestrator run",
+        "operationId": "getResearchStatus",
+        "responses": {
+          "200": {
+            "description": "Research status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": ["idle", "searching", "analyzing", "completed", "error"]
+                    },
+                    "progress": {
+                      "type": "object",
+                      "properties": {
+                        "current": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        },
+                        "step": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/research/results": {
+      "get": {
+        "tags": ["Research"],
+        "summary": "Get research results",
+        "description": "Retrieve analyzed repositories with AI summaries, ranked by score and analysis confidence",
+        "operationId": "getResearchResults",
+        "parameters": [
+          {
+            "name": "min_score",
+            "in": "query",
+            "description": "Minimum project score threshold (0.0 to 1.0)",
+            "schema": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.6
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of results to return",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Research results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total_projects": {
+                      "type": "integer"
+                    },
+                    "min_score_filter": {
+                      "type": "number"
+                    },
+                    "limit_applied": {
+                      "type": "integer"
+                    },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RepositoryResult"
+                      }
+                    }
+                  }
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          }
+        }
+      }
+    },
+    "/research/analysis": {
+      "get": {
+        "tags": ["Research"],
+        "summary": "Get repository analysis",
+        "description": "Get detailed AI analysis of a specific repository",
+        "operationId": "getRepositoryAnalysis",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "query",
+            "required": true,
+            "description": "Repository in format 'owner/repo'",
+            "schema": {
+              "type": "string",
+              "pattern": "^[^/]+/[^/]+$",
+              "example": "cloudflare/workers-sdk"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Repository analysis data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "repo": {
+                      "type": "string"
+                    },
+                    "analysis": {
+                      "$ref": "#/components/schemas/RepositoryAnalysis"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": ["success", "no_data"]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid repository format"
+          }
+        }
+      }
+    },
+    "/research/risks": {
+      "get": {
+        "tags": ["Research"],
+        "summary": "Get repositories with risk flags",
+        "description": "Safety board view - lists repos with identified security or quality risks",
+        "operationId": "getRepositoryRisks",
+        "responses": {
+          "200": {
+            "description": "Repositories with risk flags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total_analyses": {
+                      "type": "integer"
+                    },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RepositoryRisk"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/research/analyze": {
+      "post": {
+        "tags": ["Research"],
+        "summary": "Analyze repository",
+        "description": "Manually run lightweight code analysis for a specific repository",
+        "operationId": "analyzeRepository",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "owner": {
+                    "type": "string",
+                    "description": "Repository owner"
+                  },
+                  "repo": {
+                    "type": "string",
+                    "description": "Repository name"
+                  },
+                  "force": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Force re-analysis even if recent analysis exists"
+                  }
+                },
+                "required": ["owner", "repo"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis completed or skipped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "analysis": {
+                      "$ref": "#/components/schemas/RepositoryAnalysis"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing required parameters"
+          },
+          "404": {
+            "description": "Repository not found"
+          }
+        }
+      }
+    },
+    "/research/structured": {
+      "get": {
+        "tags": ["Research"],
+        "summary": "Get structured analysis",
+        "description": "Returns projects with structured AI analysis as JSON objects",
+        "operationId": "getStructuredAnalysis",
+        "parameters": [
+          {
+            "name": "binding",
+            "in": "query",
+            "description": "Filter by Cloudflare Workers binding type",
+            "schema": {
+              "type": "string",
+              "enum": ["d1", "durable_objects", "r2", "ai", "kv"]
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Filter by repository type",
+            "schema": {
+              "type": "string",
+              "enum": ["frontend", "backend", "fullstack", "library", "tool"]
+            }
+          },
+          {
+            "name": "min_conf",
+            "in": "query",
+            "description": "Minimum confidence threshold",
+            "schema": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Structured analysis results"
+          }
+        }
+      }
+    },
+    "/research/analyze-structured": {
+      "post": {
+        "tags": ["Research"],
+        "summary": "Run structured analysis",
+        "description": "Manually run structured code analysis for a specific repository",
+        "operationId": "analyzeRepositoryStructured",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "repo": {
+                    "type": "string"
+                  },
+                  "force": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": ["owner", "repo"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Structured analysis completed"
+          }
+        }
+      }
+    },
+    "/colby/operations/{id}": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Get operation progress",
+        "description": "Retrieve real-time progress information for a specific operation",
+        "operationId": "getOperationProgress",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Operation ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Operation progress",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationProgress"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Operation not found"
+          }
+        }
+      }
+    },
+    "/colby/commands": {
+      "get": {
+        "tags": ["Colby Commands"],
+        "summary": "List colby commands",
+        "description": "Get history of colby command executions with filtering options",
+        "operationId": "getColbyCommands",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "query",
+            "description": "Filter by repository",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "author",
+            "in": "query",
+            "description": "Filter by command author",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by execution status",
+            "schema": {
+              "type": "string",
+              "enum": ["queued", "working", "completed", "failed"]
+            }
+          },
+          {
+            "name": "command",
+            "in": "query",
+            "description": "Filter by command type",
+            "schema": {
+              "type": "string",
+              "enum": ["implement", "create issue", "bookmark", "extract suggestions", "summarize", "help"]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of results",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Pagination offset",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Command history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "commands": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ColbyCommand"
+                      }
+                    },
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    }
+                  }
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          }
+        }
+      }
+    },
+    "/colby/best-practices": {
+      "get": {
+        "tags": ["Best Practices"],
+        "summary": "List best practices",
+        "description": "Retrieve bookmarked code suggestions and best practices",
+        "operationId": "getBestPractices",
+        "parameters": [
+          {
+            "name": "category",
+            "in": "query",
+            "description": "Filter by category",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subcategory",
+            "in": "query",
+            "description": "Filter by subcategory",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status",
+            "schema": {
+              "type": "string",
+              "enum": ["pending", "approved", "rejected"],
+              "default": "pending"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Best practices list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "practices": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/BestPractice"
+                      }
+                    },
+                    "pagination": {
+                      "$ref": "#/components/schemas/Pagination"
+                    }
+                  }
+                }
+              },
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/colby/repo/{owner}/{repo}": {
+      "get": {
+        "tags": ["Colby Commands"],
+        "summary": "Get repo-specific activity",
+        "description": "Retrieve colby activity for a specific repository",
+        "operationId": "getRepoActivity",
+        "parameters": [
+          {
+            "name": "owner",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Repository activity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "repo": {
+                      "type": "string"
+                    },
+                    "commands": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ColbyCommand"
+                      }
+                    },
+                    "bestPractices": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/BestPractice"
+                      }
+                    },
+                    "issues": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ColbyIssue"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": ["Dashboard"],
+        "summary": "Main dashboard",
+        "description": "Web-based dashboard UI for monitoring and managing the GitHub bot",
+        "operationId": "getDashboard",
+        "responses": {
+          "200": {
+            "description": "Dashboard HTML page",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/github/webhook": {
+      "post": {
+        "tags": ["GitHub"],
+        "summary": "GitHub webhook handler",
+        "description": "Receives GitHub webhook events and processes them via Durable Objects",
+        "operationId": "handleWebhook",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "GitHub webhook payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook processed successfully"
+          },
+          "401": {
+            "description": "Invalid webhook signature"
+          }
+        },
+        "security": [
+          {
+            "webhookSignature": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "RepositoryResult": {
+        "type": "object",
+        "properties": {
+          "full_name": {
+            "type": "string",
+            "example": "cloudflare/workers-sdk"
+          },
+          "html_url": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://github.com/cloudflare/workers-sdk"
+          },
+          "stars": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "short_summary": {
+            "type": "string",
+            "nullable": true
+          },
+          "long_summary": {
+            "type": "string",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "integer",
+            "description": "Unix timestamp"
+          },
+          "ai_summary_short": {
+            "type": "string",
+            "nullable": true
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "nullable": true
+          },
+          "risk_flags_json": {
+            "type": "string",
+            "nullable": true
+          },
+          "analyzed_at": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "RepositoryAnalysis": {
+        "type": "object",
+        "properties": {
+          "repo_full_name": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "summary_short": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "risk_flags_json": {
+            "type": "string"
+          },
+          "structured_json": {
+            "type": "string",
+            "nullable": true
+          },
+          "analyzed_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "RepositoryRisk": {
+        "type": "object",
+        "properties": {
+          "repo_full_name": {
+            "type": "string"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "summary_short": {
+            "type": "string"
+          },
+          "risk_flags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "analyzed_at": {
+            "type": "integer"
+          },
+          "html_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "stars": {
+            "type": "integer",
+            "nullable": true
+          },
+          "score": {
+            "type": "number",
+            "nullable": true
+          }
+        }
+      },
+      "OperationProgress": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "prNumber": {
+            "type": "integer",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": ["started", "progress", "completed", "failed"]
+          },
+          "progress": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "currentStep": {
+            "type": "string"
+          },
+          "stepsTotal": {
+            "type": "integer"
+          },
+          "stepsCompleted": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "updatedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "ColbyCommand": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "deliveryId": {
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "prNumber": {
+            "type": "integer",
+            "nullable": true
+          },
+          "author": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string",
+            "enum": ["implement", "create issue", "bookmark", "extract suggestions", "summarize", "help"]
+          },
+          "commandArgs": {
+            "type": "object",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "working", "completed", "failed"]
+          },
+          "promptGenerated": {
+            "type": "string",
+            "nullable": true
+          },
+          "resultData": {
+            "type": "object",
+            "nullable": true
+          },
+          "errorMessage": {
+            "type": "string",
+            "nullable": true
+          },
+          "startedAt": {
+            "type": "integer",
+            "nullable": true
+          },
+          "completedAt": {
+            "type": "integer",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "BestPractice": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "suggestionText": {
+            "type": "string"
+          },
+          "contextRepo": {
+            "type": "string"
+          },
+          "contextPr": {
+            "type": "integer",
+            "nullable": true
+          },
+          "contextFile": {
+            "type": "string",
+            "nullable": true
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "category": {
+            "type": "string"
+          },
+          "subcategory": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "approved", "rejected"]
+          },
+          "bookmarkedBy": {
+            "type": "string"
+          },
+          "votesUp": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "votesDown": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "updatedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "ColbyIssue": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "repo": {
+            "type": "string"
+          },
+          "issue_number": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "webhookSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Hub-Signature-256",
+        "description": "GitHub webhook signature for request verification"
+      }
+    }
+  }
+}

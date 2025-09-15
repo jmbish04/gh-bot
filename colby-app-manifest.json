@@ -1,0 +1,31 @@
+{
+  "name": "Colby GitHub Bot",
+  "url": "https://gh-bot.hacolby.workers.dev",
+  "description": "AI-powered GitHub workflow automation and research.",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://gh-bot.hacolby.workers.dev/github/webhook",
+    "active": true
+  },
+  "redirect_url": "https://gh-bot.hacolby.workers.dev/github/manifest/callback",
+  "callback_urls": [
+    "https://gh-bot.hacolby.workers.dev/github/oauth/callback"
+  ],
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "read",
+    "issues": "write",
+    "pull_requests": "write",
+    "checks": "read",
+    "actions": "read"
+  },
+  "default_events": [
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "check_suite",
+    "check_run",
+    "push"
+  ]
+}

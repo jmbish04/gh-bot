@@ -1,0 +1,339 @@
+// /// <reference types="@cloudflare/worker//// GitHub webhook receiver (we'll hook auto-commit logic later)
+// //app.post('/github/webhook', (c: HonoContext) => handleWebhook(c.req.raw, c.env))
+
+// // export default {Hub webhook receiver (we'll hook auto-commit logic later)
+// // app.post('/github/webhook', (c: HonoContext) => handleWebhook(c.req.raw, c.env))types" />
+// import { Hono, Context } from 'hono'
+// import { summarizeRepo } from './modules/ai'
+// import { insertRepoIfNew, markRepoSynced } from './modules/db'
+// import { getInstallationToken, listInstallations, listReposForInstallation } from './modules/github'
+// import { analyzeRepoCode, analyzeRepoCodeStructured } from './modules/repo_analyzer'
+// import { handleWebhook } from './routes/webook'
+// import { asyncGeneratorToStream } from './stream'
+
+// type Env = {
+//   DB: D1Database
+//   GITHUB_APP_ID: string
+//   GITHUB_PRIVATE_KEY: string
+//   GITHUB_WEBHOOK_SECRET: string
+//   CF_ACCOUNT_ID: string
+//   CF_API_TOKEN: string
+//   SUMMARY_CF_MODEL: string
+//   RESEARCH_ORCH?: DurableObjectNamespace
+//   PR_WORKFLOWS: DurableObjectNamespace
+// }
+
+// type HonoContext = Context<{ Bindings: Env }>
+
+// const app = new Hono<{ Bindings: Env }>()
+
+// app.get('/health', (c: HonoContext) => c.json({ ok: true }))
+
+// // Optional: stream a chat/tool run (shows your stream.ts in action)
+// app.get('/demo/stream', (c: HonoContext) => {
+//   async function* run() {
+//     yield 'starting…'
+//     await new Promise(r => setTimeout(r, 300))
+//     yield 'working…'
+//     await new Promise(r => setTimeout(r, 300))
+//     yield 'done.'
+//   }
+//   return new Response(asyncGeneratorToStream(run()), {
+//     headers: { 'Content-Type': 'text/event-stream' }
+//   })
+// })
+
+// // GitHub webhook receiver (we’ll hook auto-commit logic later)
+// app.post('/github/webhook', (c) => handleWebhook(c.req.raw, c.env))
+
+// export default {
+//   fetch: (req: Request, env: Env, ctx: ExecutionContext) => app.fetch(req, env, ctx),
+//   scheduled: async (_evt: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
+//     ctx.waitUntil(syncRepos(env))
+//   }
+// }
+
+// // Cron job: discover repos, summarize, store in D1
+// async function syncRepos(env: Env) {
+//   const installations = await listInstallations(env)
+//   const installationList = Array.isArray(installations) ? installations : []
+//   for (const inst of installationList) {
+//     const token = await getInstallationToken(env, inst.id)
+//     const repos = await listReposForInstallation(token)
+//     for (const r of repos) {
+//       const inserted = await insertRepoIfNew(env.DB, {
+//         id: r.id,
+//         full_name: r.full_name,
+//         installation_id: inst.id,
+//         default_branch: r.default_branch,
+//         visibility: r.visibility,
+//         description: r.description || '',
+//         topics: r.topics || []
+//       })
+//       if (inserted) {
+//         const readme = await fetchReadme(token, r.owner.login, r.name, r.default_branch)
+//         const summary = await summarizeRepo(env, { meta: r, readme })
+//         await env.DB.prepare(
+//           'UPDATE repos SET summary=?, last_synced=? WHERE full_name=?'
+//         ).bind(summary, Date.now(), r.full_name).run()
+//       } else {
+//         await markRepoSynced(env.DB, r.full_name)
+//       }
+//     }
+//   }
+// }
+
+// async function fetchReadme(token: string, owner: string, repo: string, branch: string) {
+//   const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`, {
+//     headers: { Authorization: `token ${token}` }
+//   })
+//   if (res.ok) return await res.text()
+//   return ''
+// }
+
+// app.post('/research/run', async (c: HonoContext) => {
+//   if (!c.env.RESEARCH_ORCH) {
+//     return c.json({ error: 'Research orchestrator not available' }, 503)
+//   }
+//   const doId = c.env.RESEARCH_ORCH.idFromName('global')
+//   const stub = c.env.RESEARCH_ORCH.get(doId)
+//   const body = await c.req.json().catch(()=>({}))
+//   const res = await stub.fetch('https://do/run', { method:'POST', body: JSON.stringify(body) })
+//   return new Response(await res.text(), { status: res.status })
+// })
+
+// app.get('/research/status', async (c: HonoContext) => {
+//   if (!c.env.RESEARCH_ORCH) {
+//     return c.json({ error: 'Research orchestrator not available' }, 503)
+//   }
+//   const stub = c.env.RESEARCH_ORCH.get(c.env.RESEARCH_ORCH.idFromName('global'))
+//   const res = await stub.fetch('https://do/status')
+//   return new Response(await res.text(), { status: res.status })
+// })
+
+// app.get('/research/results', async (c: HonoContext) => {
+//   const min = Number(c.req.query('min_score') ?? '0.6')
+//   const lim = Math.min(Number(c.req.query('limit') ?? '50'), 200)
+//   const rows = await c.env.DB.prepare(`
+//     SELECT
+//       p.full_name, p.html_url, p.stars, p.score,
+//       p.short_summary, p.long_summary, p.updated_at,
+//       ra.purpose, ra.summary_short as ai_summary_short,
+//       ra.confidence, ra.risk_flags_json, ra.analyzed_at
+//     FROM projects p
+//     LEFT JOIN repo_analysis ra ON p.full_name = ra.repo_full_name
+//     WHERE p.score >= ?
+//     ORDER BY p.score DESC, ra.confidence DESC NULLS LAST
+//     LIMIT ?
+//   `).bind(min, lim).all()
+//   return c.json(rows.results || [])
+// })
+
+// // GET /research/analysis?repo=owner/name
+// app.get('/research/analysis', async (c: HonoContext) => {
+//   const repo = c.req.query('repo')
+//   if (!repo) return c.text('repo required', 400)
+//   const row = await c.env.DB.prepare('SELECT * FROM repo_analysis WHERE repo_full_name=?')
+//     .bind(repo).first()
+//   return c.json(row || {})
+// })
+
+// // GET /research/risks - Dashboard of repositories with risk flags
+// app.get('/research/risks', async (c: HonoContext) => {
+//   const rows = await c.env.DB.prepare(`
+//     SELECT
+//       ra.repo_full_name, ra.purpose, ra.summary_short,
+//       ra.risk_flags_json, ra.confidence, ra.analyzed_at,
+//       p.html_url, p.stars, p.score
+//     FROM repo_analysis ra
+//     LEFT JOIN projects p ON ra.repo_full_name = p.full_name
+//     WHERE ra.risk_flags_json != '[]' AND ra.risk_flags_json IS NOT NULL
+//     ORDER BY ra.confidence DESC, p.score DESC NULLS LAST
+//     LIMIT 100
+//   `).all()
+
+//   return c.json((rows.results || []).map((row: any) => ({
+//     ...row,
+//     risk_flags: JSON.parse(row.risk_flags_json || '[]')
+//   })))
+// })
+
+// // POST /research/analyze - Manual trigger for analyzing a specific repo
+// app.post('/research/analyze', async (c: HonoContext) => {
+//   const body = await c.req.json().catch(() => ({}))
+//   const { owner, repo, force = false } = body
+
+//   if (!owner || !repo) {
+//     return c.json({ error: 'owner and repo required' }, 400)
+//   }
+
+//   try {
+//     // Get installation token (assuming we have access)
+//     const installations = await listInstallations(c.env)
+//     const installationList = Array.isArray(installations) ? installations : []
+
+//     if (installationList.length === 0) {
+//       return c.json({ error: 'No GitHub installations available' }, 400)
+//     }
+
+//     const token = await getInstallationToken(c.env, installationList[0].id)
+
+//     // Check if analysis exists and is fresh (unless forced)
+//     if (!force) {
+//       const existing = await c.env.DB.prepare('SELECT analyzed_at FROM repo_analysis WHERE repo_full_name = ?')
+//         .bind(`${owner}/${repo}`).first()
+
+//       if (existing) {
+//         const age = Date.now() - (existing as any).analyzed_at
+//         const maxAge = 24 * 60 * 60 * 1000 // 24 hours
+//         if (age < maxAge) {
+//           return c.json({ message: 'Analysis is recent, use force=true to override' }, 200)
+//         }
+//       }
+//     }
+
+//     // Get repo default branch
+//     const repoInfo = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+//       headers: { Authorization: `token ${token}` }
+//     }).then(r => r.json()) as any
+
+//     if (!repoInfo.default_branch) {
+//       return c.json({ error: 'Repository not found or no access' }, 404)
+//     }
+
+//     // Trigger analysis
+//     const analysis = await analyzeRepoCode(c.env as any, {
+//       token,
+//       owner,
+//       repo,
+//       ref: repoInfo.default_branch
+//     })
+
+//     return c.json({
+//       message: 'Analysis completed',
+//       analysis
+//     })
+
+//   } catch (error) {
+//     return c.json({
+//       error: 'Analysis failed',
+//       details: String(error)
+//     }, 500)
+//   }
+// })
+
+// // GET /research/structured - Query repos with structured analysis
+// app.get('/research/structured', async (c: HonoContext) => {
+//   const binding = c.req.query('binding')
+//   const kind = c.req.query('kind')
+//   const minConf = Number(c.req.query('min_conf') ?? '0.0')
+
+//   // Build query to join projects + analysis + optional binding index
+//   let sql = `
+//     SELECT p.full_name, p.html_url, p.stars, a.structured_json
+//     FROM projects p
+//     JOIN repo_analysis a ON a.repo_full_name = p.full_name
+//     WHERE a.structured_json IS NOT NULL
+//   `
+//   const args: any[] = []
+
+//   if (binding) {
+//     sql += ` AND EXISTS (
+//       SELECT 1 FROM repo_analysis_bindings b
+//       WHERE b.repo_full_name = p.full_name AND b.binding = ?
+//     )`
+//     args.push(binding)
+//   }
+
+//   if (kind) {
+//     sql += ` AND json_extract(a.structured_json, '$.repo_kind') = ?`
+//     args.push(kind)
+//   }
+
+//   if (!Number.isNaN(minConf) && minConf > 0) {
+//     sql += ` AND json_extract(a.structured_json, '$.confidence') >= ?`
+//     args.push(minConf)
+//   }
+
+//   sql += ` ORDER BY p.stars DESC, p.updated_at DESC LIMIT 200`
+
+//   try {
+//     const rows = await c.env.DB.prepare(sql).bind(...args).all()
+//     return c.json((rows.results || []).map((r: any) => ({
+//       full_name: r.full_name,
+//       html_url: r.html_url,
+//       stars: r.stars,
+//       analysis: JSON.parse(r.structured_json || '{}')
+//     })))
+//   } catch (error) {
+//     return c.json({ error: 'Query failed', details: String(error) }, 500)
+//   }
+// })
+
+// // POST /research/analyze-structured - Manual trigger for structured analysis
+// app.post('/research/analyze-structured', async (c: HonoContext) => {
+//   const body = await c.req.json().catch(() => ({}))
+//   const { owner, repo, force = false } = body
+
+//   if (!owner || !repo) {
+//     return c.json({ error: 'owner and repo required' }, 400)
+//   }
+
+//   try {
+//     // Get installation token (assuming we have access)
+//     const installations = await listInstallations(c.env)
+//     const installationList = Array.isArray(installations) ? installations : []
+
+//     if (installationList.length === 0) {
+//       return c.json({ error: 'No GitHub installations available' }, 400)
+//     }
+
+//     const token = await getInstallationToken(c.env, installationList[0].id)
+
+//     // Check if structured analysis exists and is fresh (unless forced)
+//     if (!force) {
+//       const existing = await c.env.DB.prepare(
+//         'SELECT analyzed_at, structured_json FROM repo_analysis WHERE repo_full_name = ?'
+//       ).bind(`${owner}/${repo}`).first()
+
+//       if (existing && (existing as any).structured_json) {
+//         const age = Date.now() - (existing as any).analyzed_at
+//         const maxAge = 24 * 60 * 60 * 1000 // 24 hours
+//         if (age < maxAge) {
+//           return c.json({
+//             message: 'Structured analysis is recent, use force=true to override',
+//             analysis: JSON.parse((existing as any).structured_json)
+//           }, 200)
+//         }
+//       }
+//     }
+
+//     // Get repo default branch
+//     const repoInfo = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+//       headers: { Authorization: `token ${token}` }
+//     }).then(r => r.json()) as any
+
+//     if (!repoInfo.default_branch) {
+//       return c.json({ error: 'Repository not found or no access' }, 404)
+//     }
+
+//     // Trigger structured analysis
+//     const analysis = await analyzeRepoCodeStructured(c.env as any, {
+//       token,
+//       owner,
+//       repo,
+//       ref: repoInfo.default_branch
+//     })
+
+//     return c.json({
+//       message: 'Structured analysis completed',
+//       analysis
+//     })
+
+//   } catch (error) {
+//     return c.json({
+//       error: 'Structured analysis failed',
+//       details: String(error)
+//     }, 500)
+//   }
+// })

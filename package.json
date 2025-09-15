@@ -1,0 +1,30 @@
+{
+    "name": "gh-bot",
+    "version": "1.0.0",
+    "description": "Cloudflare Worker GitHub Bot with PR Webhooks, OAuth, and D1 storage",
+    "type": "module",
+    "scripts": {
+        "dev": "npx wrangler dev",
+        "build": "npx wrangler build",
+        "migrate:remote": "npx wrangler d1 migrations apply DB --remote",
+        "migrate:local": "npx wrangler d1 migrations apply DB --local",
+        "deploy": "pnpm run migrate:remote && pnpm run build && npx wrangler deploy"
+    },
+    "dependencies": {
+        "@octokit/rest": "^22.0.0",
+        "@octokit/webhooks-methods": "^4.1.0",
+        "@tsndr/cloudflare-worker-jwt": "^3.2.0",
+        "h3": "^1.15.4",
+        "hono": "^4.9.2",
+        "openai": "^5.12.2"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^4.20250816.0",
+        "@types/node": "^20.19.11",
+        "wrangler": "^4.34.0"
+    },
+    "engines": {
+        "node": ">=18"
+    },
+    "packageManager": "pnpm@9.7.0"
+}
