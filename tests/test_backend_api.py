@@ -18,7 +18,7 @@ def _check_cors_headers(case: unittest.TestCase, response: requests.Response):
 class BackendAPITests(unittest.TestCase):
     def get(self, path: str) -> requests.Response:
         resp = requests.get(f"{BASE_URL}{path}", headers=HEADERS, timeout=10)
-        _check_cors_headers(resp)
+        _check_cors_headers(self, resp)
         return resp
 
     def test_stats(self):
