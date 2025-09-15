@@ -164,8 +164,10 @@ Please provide a JSON response with the following structure:
   async generateActionCommands(repo: any, analysis: RepoAnalysis): Promise<ActionRecommendation[]> {
     const commands: ActionRecommendation[] = [];
 
+    const badges: any[] = (analysis as any).badges || [];
+
     // Deploy commands
-    if (badges.some(b => b.id === 'cloudflare-worker')) {
+    if (badges.some((b: any) => b.id === 'cloudflare-worker')) {
       commands.push({
         id: 'deploy-workers',
         title: 'Deploy to Cloudflare Workers',

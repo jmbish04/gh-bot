@@ -104,12 +104,89 @@ type HonoContext = Context<{ Bindings: Env }>;
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Global CORS headers for API responses
+const CORS_HEADERS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+// Apply CORS headers to all responses
+app.use("*", async (c, next) => {
+        await next();
+        for (const [k, v] of Object.entries(CORS_HEADERS)) {
+                c.res.headers.set(k, v);
+        }
+});
+
+// Handle preflight requests
+app.options("*", () => new Response(null, { headers: CORS_HEADERS }));
+
 /**
  * GET /health
  * Lightweight liveness probe for uptime checks & CI smoke tests.
  * Returns 200 with { ok: true } if the worker is reachable.
  */
 app.get("/health", (c: HonoContext) => c.json({ ok: true }));
+
+/**
+ * GET /api/health
+ * Dashboard JSON health check
+ */
+app.get("/api/health", (c: HonoContext) =>
+        c.json({ status: "healthy", timestamp: new Date().toISOString() })
+);
+
+/**
+ * GET /api/research/status
+ * JSON research operation status
+ */
+app.get("/api/research/status", async (c: HonoContext) => {
+        if (!c.env.RESEARCH_ORCH) {
+                return c.json(
+                        {
+                                status: "error",
+                                progress: 0,
+                                current_operation:
+                                        "Research orchestrator unavailable",
+                        },
+                        500,
+                );
+        }
+        try {
+                const stub = c.env.RESEARCH_ORCH.get(
+                        c.env.RESEARCH_ORCH.idFromName("global"),
+                );
+                const res = await stub.fetch("https://do/status");
+                if (!res.ok) {
+                        return c.json(
+                                {
+                                        status: "error",
+                                        progress: 0,
+                                        current_operation: `${res.status} ${res.statusText}`,
+                                },
+                                res.status as any,
+                        );
+                }
+                const data: any = await res.json();
+                return c.json({
+                        status: data.status || "idle",
+                        progress: data.progress ?? 0,
+                        current_operation: data.current_operation || "",
+                });
+        } catch (err) {
+                const errStr = err instanceof Error ? err.message : String(err);
+                console.error(`[GET /api/research/status] Failed to fetch status: ${errStr}`);
+                return c.json(
+                        {
+                                status: "error",
+                                progress: 0,
+                                current_operation: `Failed to fetch status: ${errStr}`,
+                        },
+                        500,
+                );
+        }
+});
 
 /**
  * GET /demo/stream
@@ -2609,16 +2686,31 @@ app.get("/api/recent-activity", async (c: HonoContext) => {
 			// Table doesn't exist, return empty activity
 		}
 
-		const commands = (recentCommands.results || []) as any[];
+                const commands = (recentCommands.results || []) as any[];
 
-		if (commands.length === 0) {
-			return c.html('<div class="loading">No recent activity</div>');
-		}
+                const accept = c.req.header("Accept") || "";
+                if (accept.includes("application/json")) {
+                        return c.json({
+                                activity: commands.map((cmd) => ({
+                                        id: cmd.id,
+                                        type: "command",
+                                        command: cmd.command,
+                                        repo: cmd.repo,
+                                        author: cmd.author,
+                                        status: cmd.status,
+                                        timestamp: cmd.created_at,
+                                })),
+                        });
+                }
 
-		const html = commands
-			.map((cmd) => {
-				const timeAgo = new Date(cmd.created_at).toLocaleString();
-				return `
+                if (commands.length === 0) {
+                        return c.html('<div class="loading">No recent activity</div>');
+                }
+
+                const html = commands
+                        .map((cmd) => {
+                                const timeAgo = new Date(cmd.created_at).toLocaleString();
+                                return `
         <div class="operation-item">
           <div class="operation-info">
             <h4>/colby ${cmd.command}</h4>
@@ -2629,13 +2721,17 @@ app.get("/api/recent-activity", async (c: HonoContext) => {
           <span class="status ${cmd.status}">${cmd.status}</span>
         </div>
       `;
-			})
-			.join("");
+                        })
+                        .join("");
 
-		return c.html(html);
-	} catch (error) {
-		return c.html('<div class="loading">Error loading recent activity</div>');
-	}
+                return c.html(html);
+        } catch (error) {
+                const accept = c.req.header("Accept") || "";
+                if (accept.includes("application/json")) {
+                        return c.json({ error: "Error loading recent activity" }, 500);
+                }
+                return c.html('<div class="loading">Error loading recent activity</div>');
+        }
 });
 
 
@@ -3220,8 +3316,8 @@ app.get("/openapi.json", async (c: HonoContext) => {
 		if (!response.ok) {
 			throw new Error(`Failed to fetch OpenAPI spec: ${response.status}`);
 		}
-		const spec = await response.json();
-		return c.json(spec);
+                const spec: any = await response.json();
+                return c.json(spec);
 	} catch (error) {
 		console.error("Error loading OpenAPI spec:", error);
 		return c.json({ error: "Failed to load OpenAPI specification" }, 500);
@@ -3634,8 +3730,25 @@ app.get("/api/operations", async (c: HonoContext) => {
 			.bind(Date.now() - 24 * 60 * 60 * 1000)
 			.all();
 
-		if (!operations.results || operations.results.length === 0) {
-			return c.html(`
+                const ops = (operations.results || []) as any[];
+                const accept = c.req.header("Accept") || "";
+
+                if (accept.includes("application/json")) {
+                        return c.json({
+                                operations: ops.map((op) => ({
+                                        id: op.operation_id,
+                                        type: op.operation_type,
+                                        repo: op.repo,
+                                        status: op.status,
+                                        progress: op.progress_percent,
+                                        current_step: op.current_step,
+                                        updated_at: op.updated_at,
+                                })),
+                        });
+                }
+
+                if (!ops.length) {
+                        return c.html(`
         <div class="no-operations">
           <div style="text-align: center; padding: 40px; color: #586069;">
             <h3>No Active Operations</h3>
@@ -3644,27 +3757,29 @@ app.get("/api/operations", async (c: HonoContext) => {
           </div>
         </div>
       `);
-		}
+                }
 
-		const html = (operations.results as any[])
-			.map((op) => {
-				const progress = op.progress_percent || 0;
-				const statusClass =
-					op.status === "started" || op.status === "progress" || op.status === "queued"
-						? "working"
-						: op.status === "completed"
-							? "completed"
-							: op.status === "failed"
-								? "failed"
-								: "queued";
+                const html = ops
+                        .map((op) => {
+                                const progress = op.progress_percent || 0;
+                                const statusClass =
+                                        op.status === "started" || op.status === "progress" || op.status === "queued"
+                                                ? "working"
+                                                : op.status === "completed"
+                                                        ? "completed"
+                                                        : op.status === "failed"
+                                                                ? "failed"
+                                                                : "queued";
 
-				const timeAgo = op.updated_at ? 
-					Math.round((Date.now() - op.updated_at) / 1000) : 0;
-				const timeText = timeAgo < 60 ? `${timeAgo}s ago` : 
-					timeAgo < 3600 ? `${Math.round(timeAgo / 60)}m ago` : 
-					`${Math.round(timeAgo / 3600)}h ago`;
+                                const timeAgo = op.updated_at ? Math.round((Date.now() - op.updated_at) / 1000) : 0;
+                                const timeText =
+                                        timeAgo < 60
+                                                ? `${timeAgo}s ago`
+                                                : timeAgo < 3600
+                                                        ? `${Math.round(timeAgo / 60)}m ago`
+                                                        : `${Math.round(timeAgo / 3600)}h ago`;
 
-				return `
+                                return `
         <div class="operation-item" onclick="showOperationDetail('${op.operation_id}')" style="cursor: pointer;">
           <div class="operation-info">
             <h4>${op.operation_type || 'Unknown Operation'}</h4>
@@ -3681,20 +3796,24 @@ app.get("/api/operations", async (c: HonoContext) => {
           </div>
         </div>
       `;
-			})
-			.join("");
+                        })
+                        .join("");
 
-		return c.html(html);
-	} catch (error) {
-		console.error("Error fetching operations:", error);
-		return c.html(`
+                return c.html(html);
+        } catch (error) {
+                console.error("Error fetching operations:", error);
+                const accept = c.req.header("Accept") || "";
+                if (accept.includes("application/json")) {
+                        return c.json({ error: "Failed to load operations" }, 500);
+                }
+                return c.html(`
       <div class="error">
         <h3>Error Loading Operations</h3>
         <p>Failed to load operations: ${error instanceof Error ? error.message : String(error)}</p>
         <p>Check the console for more details.</p>
       </div>
     `);
-	}
+        }
 });
 
 /**
