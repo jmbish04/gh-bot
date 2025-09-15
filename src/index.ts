@@ -125,6 +125,25 @@ app.use("*", async (c, next) => {
 app.options("*", () => new Response(null, { headers: CORS_HEADERS }));
 
 /**
+ * GET /ws
+ * WebSocket echo endpoint for realtime communication.
+ */
+app.get("/ws", (c: HonoContext) => {
+        if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") {
+                return new Response("Expected WebSocket", { status: 400 });
+        }
+        const pair = new WebSocketPair();
+        const { 0: client, 1: server } = pair;
+        server.accept();
+        server.addEventListener("message", (event) => {
+                server.send(event.data);
+        });
+        server.addEventListener("close", () => console.log("WebSocket closed"));
+        server.addEventListener("error", (err) => console.error("WebSocket error", err));
+        return new Response(null, { status: 101, webSocket: client });
+});
+
+/**
  * GET /health
  * Lightweight liveness probe for uptime checks & CI smoke tests.
  * Returns 200 with { ok: true } if the worker is reachable.
