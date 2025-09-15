@@ -1107,6 +1107,28 @@ app.get("/debug/operations", async (c: HonoContext) => {
 });
 
 /**
+ * GET /debug/webhook-events
+ * Debug endpoint to see recent webhook events
+ */
+app.get("/debug/webhook-events", async (c: HonoContext) => {
+	try {
+		const events = await c.env.DB.prepare(`
+      SELECT id, delivery, event_type, repo, action, created_at, status, message
+      FROM webhook_events
+      ORDER BY created_at DESC
+      LIMIT 20
+    `).all();
+
+		return c.json({
+			total: events.results?.length || 0,
+			events: events.results || []
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch webhook events", details: String(error) }, 500);
+	}
+});
+
+/**
  * GET /setup
  * GitHub App setup page with automated configuration
  */

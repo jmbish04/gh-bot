@@ -247,14 +247,27 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
           - group_comments: If the comment should be grouped with others
           - ignore: If no action is needed
           
-          Return JSON with: {"action": "action_name", "reason": "explanation", "confidence": 0.0-1.0}`
+          IMPORTANT: Return ONLY valid JSON in this exact format: {"action": "action_name", "reason": "explanation", "confidence": 0.5}`
         }, {
           role: 'user',
           content: `Event: ${JSON.stringify(context)}`
         }]
       })
       
-      aiAnalysis = JSON.parse(aiResponse.response)
+      // Clean and parse the AI response
+      let responseText = aiResponse.response || aiResponse
+      if (typeof responseText === 'object') {
+        responseText = JSON.stringify(responseText)
+      }
+      
+      // Extract JSON from the response (in case it's wrapped in other text)
+      const jsonMatch = responseText.match(/\{.*\}/s)
+      if (jsonMatch) {
+        aiAnalysis = JSON.parse(jsonMatch[0])
+      } else {
+        console.log('[WEBHOOK] Could not extract JSON from AI response:', responseText)
+        aiAnalysis = { action: 'ignore', reason: 'Could not parse AI response', confidence: 0 }
+      }
       console.log('[WEBHOOK] AI analysis result:', aiAnalysis)
     }
   } catch (error) {
