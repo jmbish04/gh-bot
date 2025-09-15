@@ -209,6 +209,16 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
   let errorDetails = ''
 
   console.log('[WEBHOOK] Processing event type:', event)
+  console.log('[WEBHOOK] Event details:', {
+    event,
+    hasComment: !!payload.comment,
+    hasReview: !!payload.review,
+    hasPullRequest: !!payload.pull_request,
+    hasIssue: !!payload.issue,
+    commentId: payload.comment?.id,
+    reviewId: payload.review?.id,
+    prNumber: payload.pull_request?.number || payload.issue?.number
+  })
 
   try {
     if (event === 'pull_request_review_comment') {
@@ -498,6 +508,18 @@ async function onIssueComment(env: Env, delivery: string, p: any, startTime: num
   const prNumber = p.issue.number
   const author = p.comment.user.login
   const action = p.action
+  
+  console.log('[WEBHOOK] onIssueComment called:', {
+    repo,
+    prNumber,
+    author,
+    action,
+    commentId: p.comment.id,
+    isBot: p.comment.user.type === 'Bot',
+    hasPullRequest: !!p.issue.pull_request,
+    bodyPreview: p.comment.body?.substring(0, 100)
+  })
+  
   if (p.comment.user.type === 'Bot') return new Response('bot ignored', { status: 200 })
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
