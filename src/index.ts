@@ -1112,12 +1112,30 @@ app.get("/debug/operations", async (c: HonoContext) => {
  */
 app.get("/debug/webhook-events", async (c: HonoContext) => {
 	try {
-		const events = await c.env.DB.prepare(`
-      SELECT id, delivery_id, event, repo, pr_number, author, action, created_at, response_status, response_message, error_details, payload_json, suggestions_json
-      FROM gh_events
-      ORDER BY created_at DESC
-      LIMIT 20
-    `).all();
+		const eventId = c.req.query('id');
+		
+		let query: string;
+		let params: any[];
+		if (eventId) {
+			// Query specific event by ID
+			query = `
+				SELECT id, delivery_id, event, repo, pr_number, author, action, created_at, response_status, response_message, error_details, payload_json, suggestions_json
+				FROM gh_events
+				WHERE id = ?
+			`;
+			params = [eventId];
+		} else {
+			// Query recent events
+			query = `
+				SELECT id, delivery_id, event, repo, pr_number, author, action, created_at, response_status, response_message, error_details, payload_json, suggestions_json
+				FROM gh_events
+				ORDER BY created_at DESC
+				LIMIT 20
+			`;
+			params = [];
+		}
+
+		const events = await c.env.DB.prepare(query).bind(...params).all();
 
 		return c.json({
 			total: events.results?.length || 0,
@@ -1125,6 +1143,31 @@ app.get("/debug/webhook-events", async (c: HonoContext) => {
 		});
 	} catch (error) {
 		return c.json({ error: "Failed to fetch webhook events", details: String(error) }, 500);
+	}
+});
+
+/**
+ * GET /debug/webhook-command-log
+ * Debug endpoint to see webhook command processing log
+ */
+app.get("/debug/webhook-command-log", async (c: HonoContext) => {
+	try {
+		const limit = c.req.query('limit') || '50';
+		const limitNum = parseInt(limit, 10);
+		
+		const events = await c.env.DB.prepare(`
+			SELECT id, delivery_id, command_text, command_type, command_args, execution_status, execution_result, started_at, completed_at, created_at
+			FROM webhook_command_log
+			ORDER BY id DESC
+			LIMIT ?
+		`).bind(limitNum).all();
+
+		return c.json({
+			total: events.results?.length || 0,
+			events: events.results || []
+		});
+	} catch (error) {
+		return c.json({ error: "Failed to fetch webhook command log", details: String(error) }, 500);
 	}
 });
 
@@ -2535,28 +2578,16 @@ app.get("/api/stats", async (c: HonoContext) => {
 					.catch(() => ({ count: 0 })),
 			]);
 
-		const html = `
-      <div class="stat-card">
-        <div class="stat-number">${(projectsCount as any)?.count || 0}</div>
-        <div class="stat-label">Projects Tracked</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">${(commandsCount as any)?.count || 0}</div>
-        <div class="stat-label">Commands Executed</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">${(practicesCount as any)?.count || 0}</div>
-        <div class="stat-label">Best Practices</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">${(analysisCount as any)?.count || 0}</div>
-        <div class="stat-label">AI Analyses</div>
-      </div>
-    `;
-
-		return c.html(html);
+		return c.json({
+			projects: (projectsCount as any)?.count || 0,
+			commands: (commandsCount as any)?.count || 0,
+			practices: (practicesCount as any)?.count || 0,
+			analyses: (analysisCount as any)?.count || 0,
+			operations: 0, // Will be calculated separately
+			repositories: (projectsCount as any)?.count || 0
+		});
 	} catch (error) {
-		return c.html('<div class="loading">Error loading stats</div>');
+		return c.json({ error: "Failed to load stats", details: String(error) }, 500);
 	}
 });
 
@@ -3429,10 +3460,318 @@ app.get("/openapi.json", async (c: HonoContext) => {
  * Main dashboard UI
  */
 app.get("/", async (c: HonoContext) => {
-	// Serve the static HTML file
-	const url = new URL(c.req.url);
-	url.pathname = "/html/dashboard.html";
-	return c.env.ASSETS.fetch(new Request(url.toString()));
+	return c.html(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Colby GitHub Bot - Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            background: #f6f8fa; 
+            color: #24292e;
+            line-height: 1.6;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { 
+            background: white; 
+            border-radius: 8px; 
+            padding: 30px; 
+            margin-bottom: 20px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .header h1 { color: #0366d6; margin-bottom: 10px; }
+        .header p { color: #586069; font-size: 18px; }
+        .nav { 
+            background: white; 
+            border-radius: 8px; 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .nav-buttons { 
+            display: flex; 
+            gap: 10px; 
+            flex-wrap: wrap; 
+            justify-content: center;
+        }
+        .nav-btn { 
+            background: #0366d6; 
+            color: white; 
+            border: none; 
+            padding: 12px 24px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        .nav-btn:hover { background: #0256cc; }
+        .nav-btn.active { background: #28a745; }
+        .content { 
+            background: white; 
+            border-radius: 8px; 
+            padding: 30px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .stats-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); 
+            gap: 20px; 
+            margin-bottom: 30px;
+        }
+        .stat-card { 
+            background: #f8f9fa; 
+            border: 1px solid #e1e4e8; 
+            border-radius: 6px; 
+            padding: 20px; 
+            text-align: center;
+        }
+        .stat-number { 
+            font-size: 2em; 
+            font-weight: bold; 
+            color: #0366d6; 
+            margin-bottom: 5px;
+        }
+        .stat-label { color: #586069; font-size: 14px; }
+        .btn { 
+            background: #28a745; 
+            color: white; 
+            border: none; 
+            padding: 10px 20px; 
+            border-radius: 6px; 
+            cursor: pointer; 
+            font-size: 14px;
+            margin: 5px;
+        }
+        .btn:hover { background: #218838; }
+        .btn-secondary { background: #6c757d; }
+        .btn-secondary:hover { background: #5a6268; }
+        .loading { color: #586069; font-style: italic; }
+        .error { color: #d73a49; background: #ffeef0; padding: 10px; border-radius: 6px; margin: 10px 0; }
+        .success { color: #28a745; background: #f0fff4; padding: 10px; border-radius: 6px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Colby GitHub Bot</h1>
+            <p>AI-powered GitHub workflow automation and research platform</p>
+        </div>
+        
+        <div class="nav">
+            <div class="nav-buttons">
+                <button class="nav-btn active" onclick="showTab('dashboard', event)">📊 Dashboard</button>
+                <button class="nav-btn" onclick="showTab('operations', event)">⚡ Operations</button>
+                <button class="nav-btn" onclick="showTab('commands', event)">🤖 Commands</button>
+                <button class="nav-btn" onclick="showTab('practices', event)">📋 Best Practices</button>
+                <button class="nav-btn" onclick="showTab('research', event)">🔬 Research</button>
+                <button class="nav-btn" onclick="showTab('help', event)">❓ Help</button>
+            </div>
+        </div>
+        
+        <div class="content">
+            <!-- Dashboard Tab -->
+            <div id="dashboard" class="tab-content active">
+                <h2>📊 Dashboard Overview</h2>
+                <div class="stats-grid" id="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-number loading">Loading...</div>
+                        <div class="stat-label">Total Commands</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number loading">Loading...</div>
+                        <div class="stat-label">Active Operations</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number loading">Loading...</div>
+                        <div class="stat-label">Repositories</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number loading">Loading...</div>
+                        <div class="stat-label">Best Practices</div>
+                    </div>
+                </div>
+                
+                <div style="text-align: center; margin: 30px 0;">
+                    <button class="btn" onclick="refreshStats()">🔄 Refresh Stats</button>
+                    <button class="btn btn-secondary" onclick="showTab('research', event)">🚀 Run Research</button>
+                </div>
+            </div>
+            
+            <!-- Operations Tab -->
+            <div id="operations" class="tab-content">
+                <h2>⚡ Live Operations</h2>
+                <div id="operations-content" class="loading">Loading operations...</div>
+                <div style="text-align: center; margin: 20px 0;">
+                    <button class="btn" onclick="refreshOperations()">🔄 Refresh</button>
+                </div>
+            </div>
+            
+            <!-- Commands Tab -->
+            <div id="commands" class="tab-content">
+                <h2>🤖 Recent Commands</h2>
+                <div id="commands-content" class="loading">Loading commands...</div>
+                <div style="text-align: center; margin: 20px 0;">
+                    <button class="btn" onclick="refreshCommands()">🔄 Refresh</button>
+                </div>
+            </div>
+            
+            <!-- Best Practices Tab -->
+            <div id="practices" class="tab-content">
+                <h2>📋 Best Practices</h2>
+                <div id="practices-content" class="loading">Loading best practices...</div>
+                <div style="text-align: center; margin: 20px 0;">
+                    <button class="btn" onclick="refreshPractices()">🔄 Refresh</button>
+                </div>
+            </div>
+            
+            <!-- Research Tab -->
+            <div id="research" class="tab-content">
+                <h2>🔬 Research & Analysis</h2>
+                <div style="text-align: center; margin: 30px 0;">
+                    <button class="btn" onclick="showResearchModal()">🚀 Run Research Sweep</button>
+                    <button class="btn btn-secondary" onclick="window.open('/research/status', '_blank')">📊 Research Status</button>
+                    <button class="btn btn-secondary" onclick="window.open('/research/results', '_blank')">📁 View Results</button>
+                </div>
+            </div>
+            
+            <!-- Help Tab -->
+            <div id="help" class="tab-content">
+                <h2>❓ Help & Documentation</h2>
+                <div style="margin: 20px 0;">
+                    <h3>Available Commands</h3>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li><code>/colby help</code> - Show all available commands</li>
+                        <li><code>/colby implement</code> - Implement code suggestions from AI reviewers</li>
+                        <li><code>/colby create issue</code> - Create an issue from a comment</li>
+                        <li><code>/colby group comments by file</code> - Group PR comments by file and create issues</li>
+                        <li><code>/colby resolve conflicts</code> - Help resolve merge conflicts</li>
+                    </ul>
+                </div>
+                <div style="margin: 20px 0;">
+                    <h3>Setup</h3>
+                    <p>To set up the GitHub App, visit the <a href="/setup" target="_blank">setup page</a>.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        
+        async function refreshStats() {
+            const statsGrid = document.getElementById('stats-grid');
+            statsGrid.innerHTML = '<div class="loading">Refreshing stats...</div>';
+            
+            try {
+                const response = await fetch('/api/stats');
+                const stats = await response.json();
+                
+                statsGrid.innerHTML = \`
+                    <div class="stat-card">
+                        <div class="stat-number">\${stats.commands || 0}</div>
+                        <div class="stat-label">Total Commands</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">\${stats.operations || 0}</div>
+                        <div class="stat-label">Active Operations</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">\${stats.repositories || 0}</div>
+                        <div class="stat-label">Repositories</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">\${stats.practices || 0}</div>
+                        <div class="stat-label">Best Practices</div>
+                    </div>
+                \`;
+            } catch (error) {
+                statsGrid.innerHTML = '<div class="error">Failed to load stats: ' + error.message + '</div>';
+            }
+        }
+        
+        async function refreshOperations() {
+            const content = document.getElementById('operations-content');
+            content.innerHTML = '<div class="loading">Loading operations...</div>';
+            
+            try {
+                const response = await fetch('/api/operations');
+                const html = await response.text();
+                content.innerHTML = html;
+            } catch (error) {
+                content.innerHTML = '<div class="error">Failed to load operations: ' + error.message + '</div>';
+            }
+        }
+        
+        async function refreshCommands() {
+            const content = document.getElementById('commands-content');
+            content.innerHTML = '<div class="loading">Loading commands...</div>';
+            
+            try {
+                const response = await fetch('/api/recent-activity');
+                const html = await response.text();
+                content.innerHTML = html;
+            } catch (error) {
+                content.innerHTML = '<div class="error">Failed to load commands: ' + error.message + '</div>';
+            }
+        }
+        
+        async function refreshPractices() {
+            const content = document.getElementById('practices-content');
+            content.innerHTML = '<div class="loading">Loading best practices...</div>';
+            
+            try {
+                const response = await fetch('/colby/best-practices');
+                const html = await response.text();
+                content.innerHTML = html;
+            } catch (error) {
+                content.innerHTML = '<div class="error">Failed to load best practices: ' + error.message + '</div>';
+            }
+        }
+        
+        function showResearchModal() {
+            alert('Research functionality coming soon! Use the Research Status and View Results buttons for now.');
+        }
+        
+        // Load data when tabs are shown
+        function showTab(tabName, event) {
+            // Hide all tab contents
+            const contents = document.querySelectorAll('.tab-content');
+            contents.forEach(content => content.classList.remove('active'));
+            
+            // Remove active class from all nav buttons
+            const buttons = document.querySelectorAll('.nav-btn');
+            buttons.forEach(btn => btn.classList.remove('active'));
+            
+            // Show selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked button
+            if (event && event.target) {
+                event.target.classList.add('active');
+            }
+            
+            // Load data for the tab
+            if (tabName === 'operations') {
+                refreshOperations();
+            } else if (tabName === 'commands') {
+                refreshCommands();
+            } else if (tabName === 'practices') {
+                refreshPractices();
+            }
+        }
+        
+        // Load stats on page load
+        document.addEventListener('DOMContentLoaded', refreshStats);
+    </script>
+</body>
+</html>
+	`);
 });
 
 // ===== DASHBOARD API ENDPOINTS =====
@@ -3441,39 +3780,6 @@ app.get("/", async (c: HonoContext) => {
  * GET /api/stats
  * Dashboard statistics
  */
-app.get("/api/stats", async (c: HonoContext) => {
-	try {
-		const stats = await Promise.all([
-			c.env.DB.prepare("SELECT COUNT(*) as count FROM colby_commands").first(),
-			c.env.DB.prepare(
-				'SELECT COUNT(*) as count FROM colby_commands WHERE status = "working"',
-			).first(),
-			c.env.DB.prepare("SELECT COUNT(*) as count FROM best_practices").first(),
-			c.env.DB.prepare("SELECT COUNT(*) as count FROM projects").first(),
-		]);
-
-		return c.html(`
-      <div class="stat-card">
-        <div class="stat-number">${stats[0]?.count || 0}</div>
-        <div class="stat-label">Total Commands</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">${stats[1]?.count || 0}</div>
-        <div class="stat-label">Active Operations</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">${stats[2]?.count || 0}</div>
-        <div class="stat-label">Best Practices</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">${stats[3]?.count || 0}</div>
-        <div class="stat-label">Analyzed Repos</div>
-      </div>
-    `);
-	} catch (error) {
-		return c.html('<div class="stat-card">Error loading stats</div>');
-	}
-});
 
 /**
  * GET /api/recent-activity
