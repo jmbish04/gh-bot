@@ -104,12 +104,140 @@ type HonoContext = Context<{ Bindings: Env }>;
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Global CORS headers for API responses
+const CORS_HEADERS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Content-Type": "application/json",
+};
+
+// Apply CORS headers to all responses
+app.use("*", async (c, next) => {
+        await next();
+        for (const [k, v] of Object.entries(CORS_HEADERS)) {
+                c.res.headers.set(k, v);
+        }
+});
+
+// Handle preflight requests
+app.options("*", () => new Response(null, { headers: CORS_HEADERS }));
+
 /**
  * GET /health
  * Lightweight liveness probe for uptime checks & CI smoke tests.
  * Returns 200 with { ok: true } if the worker is reachable.
  */
 app.get("/health", (c: HonoContext) => c.json({ ok: true }));
+
+/**
+ * GET /api/health
+ * Dashboard JSON health check
+ */
+app.get("/api/health", (c: HonoContext) =>
+        c.json({ status: "healthy", timestamp: new Date().toISOString() })
+);
+
+/**
+ * GET /api/stats
+ * Returns dashboard statistics (mocked)
+ */
+app.get("/api/stats", (c: HonoContext) =>
+        c.json({
+                projects: 8,
+                commands: 117,
+                practices: 12,
+                analyses: 4,
+                operations: 3,
+                repositories: 8,
+        })
+);
+
+/**
+ * GET /api/research/status
+ * JSON research operation status
+ */
+app.get("/api/research/status", async (c: HonoContext) => {
+        if (!c.env.RESEARCH_ORCH) {
+                return c.json(
+                        {
+                                status: "error",
+                                progress: 0,
+                                current_operation:
+                                        "Research orchestrator unavailable",
+                        },
+                        500,
+                );
+        }
+        try {
+                const stub = c.env.RESEARCH_ORCH.get(
+                        c.env.RESEARCH_ORCH.idFromName("global"),
+                );
+                const res = await stub.fetch("https://do/status");
+                if (!res.ok) {
+                        return c.json(
+                                {
+                                        status: "error",
+                                        progress: 0,
+                                        current_operation: `${res.status} ${res.statusText}`,
+                                },
+                                res.status,
+                        );
+                }
+                const data = await res.json();
+                return c.json({
+                        status: data.status || "idle",
+                        progress: data.progress ?? 0,
+                        current_operation: data.current_operation || "",
+                });
+        } catch (err) {
+                return c.json(
+                        {
+                                status: "error",
+                                progress: 0,
+                                current_operation: "Failed to fetch status",
+                        },
+                        500,
+                );
+        }
+});
+
+/**
+ * GET /api/operations
+ * Returns list of operations (mocked)
+ */
+app.get("/api/operations", (c: HonoContext) =>
+        c.json({
+                operations: [
+                        { id: 1, name: "Repository sync", status: "completed" },
+                        { id: 2, name: "Pull request scan", status: "running" },
+                        { id: 3, name: "Daily cleanup", status: "queued" },
+                ],
+        })
+);
+
+/**
+ * GET /api/recent-activity
+ * Returns recent activity (mocked)
+ */
+app.get("/api/recent-activity", (c: HonoContext) =>
+        c.json({
+                activity: [
+                        {
+                                id: 1,
+                                type: "repo",
+                                description: "Analyzed cloudflare/workers-sdk",
+                                timestamp: new Date().toISOString(),
+                        },
+                        {
+                                id: 2,
+                                type: "command",
+                                description: "Executed /summarize in repo-a",
+                                timestamp: new Date().toISOString(),
+                        },
+                ],
+        })
+);
 
 /**
  * GET /demo/stream
