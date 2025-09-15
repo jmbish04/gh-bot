@@ -436,7 +436,23 @@ async function onReviewComment(env: Env, delivery: string, p: any, startTime: nu
   }
 
   const body: string = p.comment.body || ''
-  const suggestions = extractSuggestions(body)
+  let suggestions = extractSuggestions(body)
+  
+  // If no suggestions in comment body but we have a diff_hunk, extract from diff_hunk
+  if (suggestions.length === 0 && p.comment.diff_hunk) {
+    console.log('[WEBHOOK] No suggestions in comment body, extracting from diff_hunk')
+    const addedLines = p.comment.diff_hunk
+      .split('\n')
+      .filter((line: string) => line.startsWith('+') && !line.startsWith('+++'))
+      .map((line: string) => line.substring(1)) // Remove the + prefix
+      .filter((line: string) => line.trim().length > 0)
+    
+    if (addedLines.length > 0) {
+      suggestions = addedLines
+      console.log(`[WEBHOOK] Extracted ${suggestions.length} suggestions from diff_hunk`)
+    }
+  }
+  
   const triggers = parseTriggers(body)
 
   console.log('[WEBHOOK] Review comment processing details:', {
