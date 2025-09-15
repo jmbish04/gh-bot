@@ -168,7 +168,7 @@ app.get("/api/research/status", async (c: HonoContext) => {
                                 res.status as any,
                         );
                 }
-                const data: any = await res.json();
+                const data: { status?: string; progress?: number; current_operation?: string } = await res.json();
                 return c.json({
                         status: data.status || "idle",
                         progress: data.progress ?? 0,
