@@ -10,7 +10,8 @@ type Env = {
   CF_ACCOUNT_ID: string
   CF_API_TOKEN: string
   SUMMARY_CF_MODEL: string
-  VECTORIZE?: Vectorize
+  VECTORIZE_INDEX: VectorizeIndex
+  AI: Ai
   R2?: R2Bucket
 }
 

@@ -94,10 +94,11 @@ type Env = {
 	FRONTEND_AUTH_PASSWORD: string;
 	RESEARCH_ORCH?: DurableObjectNamespace;
 	PR_WORKFLOWS: DurableObjectNamespace;
-	PROFILE_SCANNER: DurableObjectNamespace; // Matches wrangler.toml binding name
-	ASSETS: Fetcher; // Static assets binding
-	AI: any; // Workers AI binding
-	USER_PREFERENCES: KVNamespace; // User preferences KV storage
+        PROFILE_SCANNER: DurableObjectNamespace; // Matches wrangler.toml binding name
+        ASSETS: Fetcher; // Static assets binding
+        AI: Ai; // Workers AI binding
+        VECTORIZE_INDEX: VectorizeIndex;
+        USER_PREFERENCES: KVNamespace; // User preferences KV storage
 };
 
 type HonoContext = Context<{ Bindings: Env }>;
@@ -1915,7 +1916,9 @@ jq -r '"GITHUB_APP_ID=\(.id)\\nGITHUB_WEBHOOK_SECRET=\(.webhook_secret)\\nGITHUB
  * - p.score DESC, then analysis confidence DESC, then recency.
  */
 app.get("/research/results", async (c: HonoContext) => {
-	try {
+        const accept = c.req.header("Accept") || "";
+        const wantsHTML = accept.includes("text/html") || c.req.header("HX-Request");
+        try {
 		const minScore = c.req.query("min_score");
 		const limitParam = c.req.query("limit");
 
@@ -1969,11 +1972,7 @@ app.get("/research/results", async (c: HonoContext) => {
 			.all();
 
 		// Check if this is a request for HTML (from dashboard)
-		const acceptHeader = c.req.header("Accept") || "";
-		const isHTMLRequest =
-			acceptHeader.includes("text/html") || c.req.header("HX-Request");
-
-		if (isHTMLRequest) {
+                if (wantsHTML) {
 			if (!rows.results || rows.results.length === 0) {
 				return c.html('<div class="loading">No repositories found</div>');
 			}
@@ -2021,23 +2020,26 @@ app.get("/research/results", async (c: HonoContext) => {
 			return c.html(html);
 		}
 
-		// Format results as JSON for non-HTML requests
-		return c.json({
-			results: rows.results || [],
-			total: totalProjects,
-			showing: (rows.results || []).length,
-			minScore: min
-		});
-	} catch (error) {
-		return c.json(
-			{
-				error: "Database query failed",
-				details: String(error),
-				results: [],
-			},
-			500,
-		);
-	}
+                // Format results as JSON for non-HTML requests
+                return c.json({
+                        results: rows.results || [],
+                        total: totalProjects,
+                        showing: (rows.results || []).length,
+                        minScore: min
+                });
+        } catch (error) {
+                if (wantsHTML) {
+                        return c.html('<div class="loading">Error loading repositories</div>');
+                }
+                return c.json(
+                        {
+                                error: "Database query failed",
+                                details: String(error),
+                                results: [],
+                        },
+                        500,
+                );
+        }
 });
 
 /**
@@ -2258,7 +2260,7 @@ app.post("/research/analyze", async (c: HonoContext) => {
 			return c.json({ error: "Repository not found or no access" }, 404);
 		}
 
-		const analysis = await analyzeRepoCode(c.env as any, {
+           const analysis = await analyzeRepoCode(c.env, {
 			token,
 			owner,
 			repo,
@@ -2417,7 +2419,7 @@ app.post("/research/analyze-structured", async (c: HonoContext) => {
 			return c.json({ error: "Repository not found or no access" }, 404);
 		}
 
-		const analysis = await analyzeRepoCodeStructured(c.env as any, {
+           const analysis = await analyzeRepoCodeStructured(c.env, {
 			token,
 			owner,
 			repo,
@@ -2478,7 +2480,7 @@ app.post("/api/agent-setup", async (c: HonoContext) => {
 		});
 
 		// Generate agent assets using the service module
-		const result = await generateAgentAssets(c.env as any, {
+           const result = await generateAgentAssets(c.env, {
 			repo: repo || "api-generated-project",
 			context,
 			goals: goals || "",
@@ -2554,7 +2556,7 @@ app.post("/api/guidance", async (c: HonoContext) => {
 		});
 
 		// Generate infrastructure guidance
-		const guidance = await generateInfrastructureGuidance(c.env as any, {
+           const guidance = await generateInfrastructureGuidance(c.env, {
 			repo,
 			infraType: infrastructure,
 		});
@@ -2625,7 +2627,7 @@ app.post("/api/llm-full", async (c: HonoContext) => {
 
 		// Fetch relevant LLM content
 		const contentResults = await fetchRelevantLLMContent(
-			c.env as any,
+                   c.env,
 			projectContext,
 			{
 				forceRefresh: false,
@@ -2843,10 +2845,12 @@ app.get("/colby/commands", async (c: HonoContext) => {
 	const command = c.req.query("command");
 
 	// Safe parameter parsing with validation
-	const limitParam = c.req.query("limit");
-	const offsetParam = c.req.query("offset");
+        const limitParam = c.req.query("limit");
+        const offsetParam = c.req.query("offset");
+        const accept = c.req.header("Accept") || "";
+        const wantsHTML = accept.includes("text/html") || c.req.header("HX-Request");
 
-	// Parse and validate limit parameter
+        // Parse and validate limit parameter
 	let limit = 50; // default
 	if (limitParam) {
 		const parsedLimit = Number(limitParam);
@@ -2962,12 +2966,8 @@ app.get("/colby/commands", async (c: HonoContext) => {
 			.bind(...params)
 			.all();
 
-		// Check if this is a request for HTML (from dashboard)
-		const acceptHeader = c.req.header("Accept") || "";
-		const isHTMLRequest =
-			acceptHeader.includes("text/html") || c.req.header("HX-Request");
-
-		if (isHTMLRequest) {
+                // Check if this is a request for HTML (from dashboard)
+                if (wantsHTML) {
 			if (!commands.results || commands.results.length === 0) {
 				return c.html('<div class="loading">No commands found</div>');
 			}
@@ -3016,9 +3016,12 @@ app.get("/colby/commands", async (c: HonoContext) => {
 			})),
 			pagination: { limit, offset },
 		});
-	} catch (error) {
-		return c.json({ error: "Failed to fetch commands" }, 500);
-	}
+        } catch (error) {
+                if (wantsHTML) {
+                        return c.html('<div class="loading">Error loading commands</div>');
+                }
+                return c.json({ error: "Failed to fetch commands" }, 500);
+        }
 });
 
 /**
@@ -3026,13 +3029,15 @@ app.get("/colby/commands", async (c: HonoContext) => {
  * List bookmarked best practices
  */
 app.get("/colby/best-practices", async (c: HonoContext) => {
-	const category = c.req.query("category");
-	const subcategory = c.req.query("subcategory");
-	const status = c.req.query("status") || "pending";
+        const category = c.req.query("category");
+        const subcategory = c.req.query("subcategory");
+        const status = c.req.query("status") || "pending";
 
-	// Safe parameter parsing with validation
-	const limitParam = c.req.query("limit");
-	const offsetParam = c.req.query("offset");
+        // Safe parameter parsing with validation
+        const limitParam = c.req.query("limit");
+        const offsetParam = c.req.query("offset");
+        const accept = c.req.header("Accept") || "";
+        const wantsHTML = accept.includes("text/html") || c.req.header("HX-Request");
 
 	// Parse and validate limit parameter
 	let limit = 50; // default
@@ -3142,12 +3147,8 @@ app.get("/colby/best-practices", async (c: HonoContext) => {
 			.bind(...params)
 			.all();
 
-		// Check if this is a request for HTML (from dashboard)
-		const acceptHeader = c.req.header("Accept") || "";
-		const isHTMLRequest =
-			acceptHeader.includes("text/html") || c.req.header("HX-Request");
-
-		if (isHTMLRequest) {
+                // Check if this is a request for HTML (from dashboard)
+                if (wantsHTML) {
 			if (!practices.results || practices.results.length === 0) {
 				return c.html('<div class="loading">No best practices found</div>');
 			}
@@ -3196,9 +3197,12 @@ app.get("/colby/best-practices", async (c: HonoContext) => {
 			})),
 			pagination: { limit, offset },
 		});
-	} catch (error) {
-		return c.json({ error: "Failed to fetch best practices" }, 500);
-	}
+        } catch (error) {
+                if (wantsHTML) {
+                        return c.html('<div class="loading">Error loading best practices</div>');
+                }
+                return c.json({ error: "Failed to fetch best practices" }, 500);
+        }
 });
 
 /**

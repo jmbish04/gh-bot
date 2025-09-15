@@ -3,6 +3,7 @@
  * AI-powered repository analysis for detailed insights
  * Provides in-depth analysis of repositories with actionable recommendations
  */
+import type { RepoBadge } from './badge_detector'
 
 export interface RepoAnalysis {
   repoFullName: string;
@@ -14,6 +15,7 @@ export interface RepoAnalysis {
   weaknesses: string[];
   recommendations: ActionRecommendation[];
   bestPractices: BestPractice[];
+  badges: RepoBadge[];
   confidence: number;
   analysisTimestamp: number;
 }
@@ -42,7 +44,7 @@ export class AIRepoAnalyzer {
 
   async analyzeRepository(
     repo: any,
-    badges: any[],
+    badges: RepoBadge[],
     repoContent?: string
   ): Promise<RepoAnalysis> {
     const prompt = this.buildAnalysisPrompt(repo, badges, repoContent);
@@ -74,6 +76,7 @@ export class AIRepoAnalyzer {
         weaknesses: analysis.weaknesses || [],
         recommendations: analysis.recommendations || [],
         bestPractices: analysis.bestPractices || [],
+        badges,
         confidence: analysis.confidence || 0.5,
         analysisTimestamp: Date.now()
       };
@@ -85,7 +88,7 @@ export class AIRepoAnalyzer {
     }
   }
 
-  private buildAnalysisPrompt(repo: any, badges: any[], repoContent?: string): string {
+  private buildAnalysisPrompt(repo: any, badges: RepoBadge[], repoContent?: string): string {
     const badgeList = badges.map(b => b.label).join(', ');
     
     return `Analyze this repository and provide insights:
@@ -130,7 +133,7 @@ Please provide a JSON response with the following structure:
 }`;
   }
 
-  private createFallbackAnalysis(repo: any, badges: any[]): RepoAnalysis {
+  private createFallbackAnalysis(repo: any, badges: RepoBadge[]): RepoAnalysis {
     const badgeList = badges.map(b => b.label).join(', ');
     
     return {
@@ -156,6 +159,7 @@ Please provide a JSON response with the following structure:
         }
       ],
       bestPractices: [],
+      badges,
       confidence: 0.3,
       analysisTimestamp: Date.now()
     };
@@ -165,7 +169,7 @@ Please provide a JSON response with the following structure:
     const commands: ActionRecommendation[] = [];
 
     // Deploy commands
-    if (badges.some(b => b.id === 'cloudflare-worker')) {
+    if (analysis.badges.some(b => b.id === 'cloudflare-worker')) {
       commands.push({
         id: 'deploy-workers',
         title: 'Deploy to Cloudflare Workers',
