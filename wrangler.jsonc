@@ -37,10 +37,6 @@
       "preview_id": "user_preferences_kv_preview"
     }
   ],
-  "assets": {
-    "directory": "./public/",
-    "binding": "ASSETS"
-  },
   "vars": {
     "REQUIRED_LABEL": "auto-commit-ok",
     "SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b"

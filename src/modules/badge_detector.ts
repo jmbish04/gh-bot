@@ -173,7 +173,7 @@ const BADGE_PATTERNS: Record<string, RegExp[]> = {
   ],
   'nextjs': [
     /next\.config/i,
-    /next\/i,
+    /next/i,
     /_app\.(tsx?|jsx?)$/i,
     /_document\.(tsx?|jsx?)$/i
   ],
@@ -188,7 +188,7 @@ const BADGE_PATTERNS: Record<string, RegExp[]> = {
     /\.dockerignore/i
   ],
   'api': [
-    /api\/i,
+    /api/i,
     /endpoint/i,
     /express/i,
     /fastify/i,
