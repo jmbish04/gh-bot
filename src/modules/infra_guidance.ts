@@ -160,14 +160,14 @@ export async function generateInfrastructureGuidance(
     context: `Infrastructure type: ${context.infraType}. Current stack: ${context.currentStack?.join(', ') || 'unknown'}. Requirements: ${context.requirements || 'not specified'}`
   }
 
-  const relevantContent = await fetchRelevantLLMContent(env, llmContext)
+  const relevantContent = await fetchRelevantLLMContent(env as any, llmContext)
   console.log('[INFRA_GUIDANCE] Retrieved', relevantContent.length, 'relevant documentation sources')
 
   // Generate recommendations based on infrastructure type
-  const recommendations = await generateRecommendations(env, context, relevantContent)
+  const recommendations = await generateRecommendations(env as any, context, relevantContent)
 
   // Generate overall strategy and analysis
-  const analysis = await generateOverallAnalysis(env, context, recommendations)
+  const analysis = await generateOverallAnalysis(env as any, context, recommendations)
 
   return {
     infraType: context.infraType,
