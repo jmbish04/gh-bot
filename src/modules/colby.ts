@@ -250,16 +250,39 @@ Examples:
 Respond with only the title (no quotes, no extra text). Maximum 72 characters.`
 
   try {
+    console.log('[AI] Generating issue title with context:', {
+      repo: context.repo,
+      filePath: context.filePath,
+      line: context.line,
+      hasCommentBody: !!context.commentBody,
+      hasSuggestions: !!context.suggestions?.length,
+      hasConversationContext: !!context.conversationContext
+    })
+
     const result = await (env.AI as any).run(env.SUMMARY_CF_MODEL, {
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 2000
     })
 
-    const title = result?.response || result?.content || 'Implement suggestion from code review'
+    console.log('[AI] Title generation result:', {
+      hasResult: !!result,
+      resultType: typeof result,
+      response: result?.response,
+      content: result?.content,
+      fullResult: result
+    })
 
-    return title.replace(/["\n\r]/g, '').slice(0, 72).trim()
+    const title = result?.response || result?.content || 'Implement suggestion from code review'
+    const cleanedTitle = title.replace(/["\n\r]/g, '').slice(0, 72).trim()
+
+    console.log('[AI] Final title:', cleanedTitle)
+    return cleanedTitle
   } catch (error) {
     console.error('Failed to generate issue title:', error)
+    console.error('Error details:', {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    })
     return 'Implement suggestion from code review'
   }
 }
