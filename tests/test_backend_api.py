@@ -8,11 +8,11 @@ HEADERS = {
 }
 
 
-def _check_cors_headers(response: requests.Response):
-    assert response.headers.get("Access-Control-Allow-Origin") == "*"
-    assert response.headers.get("Access-Control-Allow-Methods") == "GET, POST, PUT, DELETE, OPTIONS"
-    assert response.headers.get("Access-Control-Allow-Headers") == "Content-Type, Authorization"
-    assert response.headers.get("Content-Type", "").split(";")[0] == "application/json"
+def _check_cors_headers(case: unittest.TestCase, response: requests.Response):
+    case.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "*")
+    case.assertEqual(response.headers.get("Access-Control-Allow-Methods"), "GET, POST, PUT, DELETE, OPTIONS")
+    case.assertEqual(response.headers.get("Access-Control-Allow-Headers"), "Content-Type, Authorization")
+    case.assertEqual(response.headers.get("Content-Type", "").split(";")[0], "application/json")
 
 
 class BackendAPITests(unittest.TestCase):
