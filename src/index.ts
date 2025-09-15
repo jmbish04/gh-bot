@@ -97,6 +97,7 @@ type Env = {
     PROFILE_SCANNER: DurableObjectNamespace; // Matches wrangler.toml binding name
     ASSETS: Fetcher; // Static assets binding
     AI: any; // Workers AI binding
+    VECTORIZE_INDEX: VectorizeIndex;
     USER_PREFERENCES: KVNamespace; // User preferences KV storage
 };
 
@@ -1936,8 +1937,6 @@ app.get("/research/results", async (c: HonoContext) => {
         if (limitParam && (Number.isNaN(requestedLimit) || requestedLimit < 1)) {
             return c.json({ error: "limit must be a positive number" }, 400);
         }
-
-        // First check if we have any projects at all
         const countResult = await c.env.DB.prepare(
             "SELECT COUNT(*) as count FROM projects",
         ).first();
