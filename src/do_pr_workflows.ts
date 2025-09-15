@@ -350,6 +350,14 @@ export class PrWorkflow {
     // For issue_opened events, we use issueNumber instead of prNumber
     const issueOrPrNumber = evt.prNumber || (evt as any).issueNumber
 
+    console.log('[DO] commentOnPR called with:', {
+      kind: evt.kind,
+      commentId: evt.commentId,
+      prNumber: evt.prNumber,
+      issueNumber: (evt as any).issueNumber,
+      issueOrPrNumber
+    })
+
     console.log('[DO] Attempting to comment on PR/Issue:', {
       hasEvent: !!evt,
       hasInstallationId: !!evt?.installationId,
@@ -563,7 +571,35 @@ export class PrWorkflow {
       }
     }
     
-    // Pattern 5: Inline code suggestions (backticks with code)
+    // Pattern 5: Gemini Code Assist specific patterns
+    // Look for code blocks that might be suggestions from Gemini Code Assist
+    const geminiPatterns = [
+      // Code blocks with specific language tags
+      /```(?:typescript|javascript|ts|js|python|py|java|cpp|c|go|rust|php|ruby|swift|kotlin|scala|r|sql|html|css|json|yaml|xml|markdown|md|bash|sh|powershell|ps1|dockerfile|docker|yaml|yml|toml|ini|conf|config|txt|text|plain|diff|patch)\s*\n([\s\S]*?)```/g,
+      // Code blocks without language tags but with code content
+      /```\s*\n([\s\S]*?)```/g
+    ]
+    
+    for (const pattern of geminiPatterns) {
+      let match: RegExpExecArray | null
+      while ((match = pattern.exec(text)) !== null) {
+        const code = match[1].trim()
+        // Check if it looks like actual code (not just text)
+        if (code.length > 10 && 
+            (code.includes('function') || code.includes('const') || code.includes('let') || code.includes('var') || 
+             code.includes('class') || code.includes('interface') || code.includes('type') || 
+             code.includes('import') || code.includes('export') || code.includes('return') ||
+             code.includes('if') || code.includes('for') || code.includes('while') ||
+             code.includes('{') || code.includes('}') || code.includes('(') || code.includes(')') ||
+             code.includes('=') || code.includes('=>') || code.includes(';') ||
+             code.includes('def ') || code.includes('class ') || code.includes('import ') ||
+             code.includes('public ') || code.includes('private ') || code.includes('protected '))) {
+          out.push(code)
+        }
+      }
+    }
+    
+    // Pattern 6: Inline code suggestions (backticks with code)
     const inlineCodeRe = /`([^`\n]{10,})`/g
     while ((m = inlineCodeRe.exec(text)) !== null) {
       const code = m[1].trim()
@@ -578,7 +614,7 @@ export class PrWorkflow {
       }
     }
     
-    // Pattern 6: Lines that look like code suggestions (indented or with specific keywords)
+    // Pattern 7: Lines that look like code suggestions (indented or with specific keywords)
     const suggestionKeywords = ['suggest', 'recommend', 'propose', 'improve', 'fix', 'update', 'change', 'modify', 'should', 'could', 'would']
     const lines = text.split('\n')
     let currentSuggestion = ''
@@ -697,6 +733,15 @@ export class PrWorkflow {
       throw new Error('Missing installationId for implement command')
     }
     const token = await getInstallationToken(this.env, evt.installationId)
+
+    console.log('[DO] handleImplementCommand called with:', {
+      kind: evt.kind,
+      commentId: evt.commentId,
+      hasSuggestions: !!evt.suggestions?.length,
+      suggestions: evt.suggestions,
+      filePath: evt.filePath,
+      line: evt.line
+    })
 
     await updateOperationProgress(this.env, operationId, {
       currentStep: 'Analyzing suggestions...',
