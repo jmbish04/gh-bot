@@ -6,6 +6,7 @@ type Env = {
   GITHUB_WEBHOOK_SECRET: string
   PR_WORKFLOWS: DurableObjectNamespace
   RESEARCH_ORCH?: DurableObjectNamespace
+  AI?: any
 }
 
 type WebhookData = {
@@ -226,49 +227,116 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
     if (env.AI && (event === 'pull_request_review_comment' || event === 'issue_comment')) {
       console.log('[WEBHOOK] Running AI analysis for comment event')
       const commentBody = payload.comment?.body || payload.review?.body || ''
+      // Send full payload to AI for comprehensive analysis
       const context = {
         event,
         action: payload.action,
-        commentBody: commentBody.substring(0, 500), // Limit context size
+        fullPayload: payload,
+        commentBody: commentBody,
         repo: payload.repository?.full_name,
         prNumber: payload.pull_request?.number,
         issueNumber: payload.issue?.number,
-        author: payload.comment?.user?.login || payload.review?.user?.login
+        author: payload.comment?.user?.login || payload.review?.user?.login,
+        commentId: payload.comment?.id || payload.review?.id,
+        isReviewComment: event === 'pull_request_review_comment',
+        hasColbyCommand: commentBody.includes('/colby')
       }
       
-      const aiResponse = await (env.AI as any).run('@cf/meta/llama-3.1-8b-instruct', {
+      console.log('[WEBHOOK] AI context (full payload):', {
+        event,
+        action: payload.action,
+        repo: payload.repository?.full_name,
+        prNumber: payload.pull_request?.number,
+        commentId: payload.comment?.id || payload.review?.id,
+        hasColbyCommand: commentBody.includes('/colby'),
+        payloadSize: JSON.stringify(payload).length
+      })
+      
+      const aiResponse = await (env.AI as any).run('@cf/meta/llama-4-scout-17b-16e-instruct', {
         messages: [{
           role: 'system',
-          content: `Analyze this GitHub webhook event and determine the best action. 
+          content: `Analyze this GitHub webhook event and determine the best action. You have access to the full webhook payload for comprehensive analysis.
           
           Available actions:
-          - process_colby_command: If the comment contains a /colby command
-          - extract_suggestions: If the comment contains code suggestions
+          - process_colby_command: If the comment contains a /colby command (like /colby implement, /colby help, etc.)
+          - extract_suggestions: If the comment contains code suggestions but no /colby command
           - group_comments: If the comment should be grouped with others
           - ignore: If no action is needed
           
-          IMPORTANT: Return ONLY valid JSON in this exact format: {"action": "action_name", "reason": "explanation", "confidence": 0.5}`
+          Analyze the full payload including:
+          - comment.body: The comment text content
+          - comment.diff_hunk: Code changes in review comments
+          - comment.path: File path for review comments
+          - pull_request: PR details and context
+          - repository: Repository information
+          
+          Look for these patterns:
+          - "/colby implement" -> process_colby_command
+          - "/colby help" -> process_colby_command  
+          - "/colby create issue" -> process_colby_command
+          - Any other "/colby" command -> process_colby_command
+          - Code blocks with suggestions but no /colby -> extract_suggestions
+          - diff_hunk with code changes -> extract_suggestions`
         }, {
           role: 'user',
           content: `Event: ${JSON.stringify(context)}`
-        }]
+        }],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            type: "object",
+            properties: {
+              action: {
+                type: "string",
+                enum: ["process_colby_command", "extract_suggestions", "group_comments", "ignore"],
+                description: "The action to take based on the webhook event"
+              },
+              reason: {
+                type: "string",
+                description: "Explanation of why this action was chosen"
+              },
+              confidence: {
+                type: "number",
+                minimum: 0,
+                maximum: 1,
+                description: "Confidence level in the decision (0-1)"
+              }
+            },
+            required: ["action", "reason", "confidence"]
+          }
+        },
+        temperature: 0.1,
+        max_tokens: 512
       })
       
-      // Clean and parse the AI response
-      let responseText = aiResponse.response || aiResponse
-      if (typeof responseText === 'object') {
-        responseText = JSON.stringify(responseText)
-      }
-      
-      // Extract JSON from the response (in case it's wrapped in other text)
-      const jsonMatch = responseText.match(/\{.*\}/s)
-      if (jsonMatch) {
-        aiAnalysis = JSON.parse(jsonMatch[0])
-      } else {
-        console.log('[WEBHOOK] Could not extract JSON from AI response:', responseText)
+      // Parse the structured JSON response
+      try {
+        if (aiResponse.response) {
+          // For structured responses, the response should already be parsed JSON
+          aiAnalysis = typeof aiResponse.response === 'string' 
+            ? JSON.parse(aiResponse.response) 
+            : aiResponse.response
+        } else {
+          // Fallback for non-structured responses
+          const responseText = typeof aiResponse === 'string' ? aiResponse : JSON.stringify(aiResponse)
+          const jsonMatch = responseText.match(/\{.*\}/s)
+          if (jsonMatch) {
+            aiAnalysis = JSON.parse(jsonMatch[0])
+          } else {
+            throw new Error('No JSON found in response')
+          }
+        }
+        
+        // Validate the response structure
+        if (!aiAnalysis.action || !aiAnalysis.reason || typeof aiAnalysis.confidence !== 'number') {
+          throw new Error('Invalid response structure')
+        }
+        
+        console.log('[WEBHOOK] AI analysis result:', aiAnalysis)
+      } catch (error) {
+        console.log('[WEBHOOK] Could not parse AI response:', error)
         aiAnalysis = { action: 'ignore', reason: 'Could not parse AI response', confidence: 0 }
       }
-      console.log('[WEBHOOK] AI analysis result:', aiAnalysis)
     }
   } catch (error) {
     console.log('[WEBHOOK] AI analysis failed, proceeding with standard processing:', error)

@@ -1113,8 +1113,8 @@ app.get("/debug/operations", async (c: HonoContext) => {
 app.get("/debug/webhook-events", async (c: HonoContext) => {
 	try {
 		const events = await c.env.DB.prepare(`
-      SELECT id, delivery, event_type, repo, action, created_at, status, message
-      FROM webhook_events
+      SELECT id, delivery_id, event, repo, pr_number, author, action, created_at, response_status, response_message, error_details, payload_json, suggestions_json
+      FROM gh_events
       ORDER BY created_at DESC
       LIMIT 20
     `).all();

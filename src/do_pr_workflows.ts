@@ -434,22 +434,81 @@ export class PrWorkflow {
       // Also get general PR comments (issue comments on the PR)
       const issueComments = await ghREST(token, 'GET', `/repos/${owner}/${repo}/issues/${prNumber}/comments`)
 
+      // Get the PR diff to look for code suggestions in the actual code changes
+      const prDiff = await ghREST(token, 'GET', `/repos/${owner}/${repo}/pulls/${prNumber}`) as any
+      const diffUrl = prDiff?.diff_url
+      let diffContent = ''
+      if (diffUrl) {
+        try {
+          const diffResponse = await fetch(diffUrl)
+          diffContent = await diffResponse.text()
+        } catch (error) {
+          console.log('[DO] Could not fetch PR diff:', error)
+        }
+      }
+
       console.log(`[DO] Found ${Array.isArray(reviewComments) ? reviewComments.length : 0} review comments and ${Array.isArray(issueComments) ? issueComments.length : 0} issue comments`)
+      console.log(`[DO] PR diff length: ${diffContent.length} characters`)
 
       if ((!Array.isArray(reviewComments) || reviewComments.length === 0) && 
-          (!Array.isArray(issueComments) || issueComments.length === 0)) {
+          (!Array.isArray(issueComments) || issueComments.length === 0) &&
+          diffContent.length === 0) {
         return {}
       }
 
       // Group suggestions by file path
       const suggestionsByFile: Record<string, Array<{suggestions: string[], diffHunk: string}>> = {}
 
+      // Process PR diff content for code suggestions
+      if (diffContent) {
+        console.log('[DO] Processing PR diff for code suggestions')
+        const diffSuggestions = this.extractSuggestions(diffContent)
+        if (diffSuggestions.length > 0) {
+          console.log(`[DO] Found ${diffSuggestions.length} suggestions in PR diff`)
+          // Extract file path from diff (look for +++ b/path/to/file)
+          const fileMatch = diffContent.match(/\+\+\+ b\/(.+)/)
+          const filePath = fileMatch ? fileMatch[1] : 'unknown'
+          if (!suggestionsByFile[filePath]) {
+            suggestionsByFile[filePath] = []
+          }
+          suggestionsByFile[filePath].push({
+            suggestions: diffSuggestions,
+            diffHunk: diffContent.substring(0, 500) // First 500 chars of diff
+          })
+        }
+      }
+
       // Process review comments (line-specific comments)
       if (Array.isArray(reviewComments)) {
         for (const comment of reviewComments) {
-          if (!comment.body || !comment.path || !comment.diff_hunk) continue
+          if (!comment.body || !comment.path) continue
 
-          const suggestions = this.extractSuggestions(comment.body)
+          console.log(`[DO] Processing review comment ${comment.id}:`, {
+            body: comment.body.substring(0, 200) + '...',
+            path: comment.path,
+            hasDiffHunk: !!comment.diff_hunk
+          })
+
+          // First, try to extract suggestions from the comment body
+          let suggestions = this.extractSuggestions(comment.body)
+          console.log(`[DO] Extracted ${suggestions.length} suggestions from comment body ${comment.id}`)
+          
+          // If no suggestions in body, but we have a diff_hunk, treat the diff_hunk as suggestions
+          if (suggestions.length === 0 && comment.diff_hunk) {
+            console.log(`[DO] No suggestions in body, treating diff_hunk as suggestions for comment ${comment.id}`)
+            // Extract the added lines from the diff hunk as suggestions
+            const addedLines = comment.diff_hunk
+              .split('\n')
+              .filter((line: string) => line.startsWith('+') && !line.startsWith('+++'))
+              .map((line: string) => line.substring(1)) // Remove the + prefix
+              .filter((line: string) => line.trim().length > 0)
+            
+            if (addedLines.length > 0) {
+              suggestions = addedLines
+              console.log(`[DO] Extracted ${suggestions.length} suggestions from diff_hunk for comment ${comment.id}`)
+            }
+          }
+
           if (suggestions.length === 0) continue
 
           console.log(`[DO] Found ${suggestions.length} suggestions in review comment on ${comment.path}`)
@@ -460,7 +519,7 @@ export class PrWorkflow {
 
           suggestionsByFile[comment.path].push({
             suggestions,
-            diffHunk: comment.diff_hunk
+            diffHunk: comment.diff_hunk || comment.body.substring(0, 500)
           })
         }
       }
