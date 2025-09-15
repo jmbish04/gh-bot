@@ -220,6 +220,47 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
     prNumber: payload.pull_request?.number || payload.issue?.number
   })
 
+  // AI-powered event analysis for intelligent processing
+  let aiAnalysis = null
+  try {
+    if (env.AI && (event === 'pull_request_review_comment' || event === 'issue_comment')) {
+      console.log('[WEBHOOK] Running AI analysis for comment event')
+      const commentBody = payload.comment?.body || payload.review?.body || ''
+      const context = {
+        event,
+        action: payload.action,
+        commentBody: commentBody.substring(0, 500), // Limit context size
+        repo: payload.repository?.full_name,
+        prNumber: payload.pull_request?.number,
+        issueNumber: payload.issue?.number,
+        author: payload.comment?.user?.login || payload.review?.user?.login
+      }
+      
+      const aiResponse = await (env.AI as any).run('@cf/meta/llama-3.1-8b-instruct', {
+        messages: [{
+          role: 'system',
+          content: `Analyze this GitHub webhook event and determine the best action. 
+          
+          Available actions:
+          - process_colby_command: If the comment contains a /colby command
+          - extract_suggestions: If the comment contains code suggestions
+          - group_comments: If the comment should be grouped with others
+          - ignore: If no action is needed
+          
+          Return JSON with: {"action": "action_name", "reason": "explanation", "confidence": 0.0-1.0}`
+        }, {
+          role: 'user',
+          content: `Event: ${JSON.stringify(context)}`
+        }]
+      })
+      
+      aiAnalysis = JSON.parse(aiResponse.response)
+      console.log('[WEBHOOK] AI analysis result:', aiAnalysis)
+    }
+  } catch (error) {
+    console.log('[WEBHOOK] AI analysis failed, proceeding with standard processing:', error)
+  }
+
   try {
     if (event === 'pull_request_review_comment') {
       console.log('[WEBHOOK] Handling pull_request_review_comment')

@@ -1139,6 +1139,7 @@ app.get("/setup", async (c: HonoContext) => {
 			"issue_comment",
 			"pull_request",
 			"pull_request_review",
+			"pull_request_review_comment",
 			"check_suite",
 			"check_run",
 			"push"
@@ -1239,6 +1240,7 @@ cat > manifest.json << 'EOF'
     "issue_comment",
     "pull_request",
     "pull_request_review",
+    "pull_request_review_comment",
     "check_suite",
     "check_run",
     "push"
@@ -1272,7 +1274,7 @@ open "https://github.com/settings/apps/new"
 # - Webhook URL: https://gh-bot.hacolby.workers.dev/github/webhook
 # - Webhook secret: (generate a random string)
 # - Permissions: See the JSON manifest below for exact permissions
-# - Events: issues, issue_comment, pull_request, pull_request_review, check_suite, check_run, push</div>
+# - Events: issues, issue_comment, pull_request, pull_request_review, pull_request_review_comment, check_suite, check_run, push</div>
             </div>
             
             <h4>Option C: Direct Manifest Link (Alternative)</h4>
@@ -1548,6 +1550,7 @@ app.post("/setup/auto", async (c: HonoContext) => {
 					"issue_comment",
 					"pull_request",
 					"pull_request_review",
+					"pull_request_review_comment",
 					"check_suite",
 					"check_run",
 					"push"
