@@ -74,6 +74,7 @@ import { AIRepoAnalyzer } from "./modules/ai_repo_analyzer";
 import { UserPreferencesManager } from "./modules/user_preferences";
 import { handleWebhook } from "./routes/webhook";
 import { asyncGeneratorToStream } from "./stream";
+import { parseColbyCommand } from "./modules/colby";
 
 /**
  * Runtime bindings available to this Worker.
@@ -2703,6 +2704,275 @@ app.post("/api/llm-full", async (c: HonoContext) => {
 
 // ===== COLBY COMMAND ENDPOINTS =====
 
+const KNOWN_COLBY_COMMANDS = [
+    "implement",
+    "create_issue",
+    "bookmark_suggestion",
+    "extract_suggestions",
+    "extract_suggestions_to_issues",
+    "group_comments_by_file",
+    "create_llms_docs",
+    "optimize_worker",
+    "help",
+    "resolve_conflicts",
+];
+
+type SuggestionDetail = {
+    source: string;
+    content: string;
+    lineCount: number;
+};
+
+function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
+    if (!value) {
+        return fallback;
+    }
+    try {
+        return JSON.parse(value) as T;
+    } catch (error) {
+        return fallback;
+    }
+}
+
+function detectTriggersFromText(text: string): string[] {
+    if (!text) {
+        return [];
+    }
+
+    const triggers: string[] = [];
+    let match: RegExpExecArray | null;
+
+    const originalRe = /^\s*\/(apply|fix|summarize|lint|test)\b.*$/gim;
+    while ((match = originalRe.exec(text)) !== null) {
+        triggers.push(match[0].trim());
+    }
+
+    const colbyRe = /^\s*\/colby\s+(implement|create\s+issue(?:\s+and\s+assign\s+to\s+copilot)?|bookmark\s+this\s+suggestion|extract\s+suggestions(?:\s+to\s+issues?)?|help|configure\s+agent|provide\s+\w+\s+guidance|provide\s+guidance|llm-full|resolve\s+conflicts?|clear\s+conflicts?|create\s+llms?\s+docs?|fetch\s+llms?\s+docs?|optimize\s+worker|setup\s+worker)\b.*$/gim;
+    while ((match = colbyRe.exec(text)) !== null) {
+        triggers.push(match[0].trim());
+    }
+
+    return triggers;
+}
+
+function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
+    suggestions: string[];
+    details: SuggestionDetail[];
+} {
+    const text = body || "";
+    const details: SuggestionDetail[] = [];
+    const seen = new Set<string>();
+
+    const record = (source: string, raw: string) => {
+        const normalized = (raw || "").replace(/\r\n/g, "\n");
+        const trimmed = normalized.trimEnd();
+        if (!trimmed.trim() || seen.has(trimmed)) {
+            return;
+        }
+        seen.add(trimmed);
+        details.push({
+            source,
+            content: trimmed,
+            lineCount: trimmed.split("\n").length,
+        });
+    };
+
+    let match: RegExpExecArray | null;
+
+    const suggestionRe = /```suggestion\s*\n([\s\S]*?)```/g;
+    while ((match = suggestionRe.exec(text)) !== null) {
+        record("suggestion_block", match[1]);
+    }
+
+    const languageBlockRe = /```(?:typescript|javascript|ts|js|python|py|java|cpp|c|go|rust|php|ruby|swift|kotlin|scala|r|sql|html|css|json|yaml|xml|markdown|md|bash|sh|powershell|ps1|dockerfile|docker|yaml|yml|toml|ini|conf|config|txt|text|plain|diff|patch)\s*\n([\s\S]*?)```/g;
+    while ((match = languageBlockRe.exec(text)) !== null) {
+        const code = match[1].trim();
+        if (code.length > 10 && !code.includes("// Example") && !code.includes("// Sample")) {
+            record("code_block", code);
+        }
+    }
+
+    const diffLineRe = /^\+.*$/gm;
+    const diffMatches = text.match(diffLineRe);
+    if (diffMatches && diffMatches.length > 0) {
+        const diffSuggestion = diffMatches.map((line) => line.substring(1)).join("\n");
+        if (diffSuggestion.trim().length > 0) {
+            record("diff_body", diffSuggestion.trim());
+        }
+    }
+
+    const aiBlockRe = /```(?:typescript|javascript|ts|js|python|py|java|cpp|c|go|rust|php|ruby|swift|kotlin|scala|r|sql|html|css|json|yaml|xml|markdown|md|bash|sh|powershell|ps1|dockerfile|docker|yaml|yml|toml|ini|conf|config|txt|text|plain|diff|patch)\s*\n([\s\S]*?)```/g;
+    while ((match = aiBlockRe.exec(text)) !== null) {
+        const code = match[1].trim();
+        if (
+            code.length > 5 &&
+            (code.includes("function") ||
+                code.includes("const") ||
+                code.includes("let") ||
+                code.includes("var") ||
+                code.includes("class") ||
+                code.includes("interface") ||
+                code.includes("type") ||
+                code.includes("import") ||
+                code.includes("export") ||
+                code.includes("return") ||
+                code.includes("if") ||
+                code.includes("for") ||
+                code.includes("while") ||
+                code.includes("{") ||
+                code.includes("}") ||
+                code.includes("(") ||
+                code.includes(")") ||
+                code.includes("=") ||
+                code.includes("=>") ||
+                code.includes(";") ||
+                code.includes("def ") ||
+                code.includes("public ") ||
+                code.includes("private ") ||
+                code.includes("protected ")))
+        ) {
+            record("ai_code_block", code);
+        }
+    }
+
+    const geminiPatterns = [
+        /```(?:typescript|javascript|ts|js|python|py|java|cpp|c|go|rust|php|ruby|swift|kotlin|scala|r|sql|html|css|json|yaml|xml|markdown|md|bash|sh|powershell|ps1|dockerfile|docker|yaml|yml|toml|ini|conf|config|txt|text|plain|diff|patch)\s*\n([\s\S]*?)```/g,
+        /```\s*\n([\s\S]*?)```/g,
+    ];
+    for (const pattern of geminiPatterns) {
+        while ((match = pattern.exec(text)) !== null) {
+            const code = match[1].trim();
+            if (
+                code.length > 10 &&
+                (code.includes("function") ||
+                    code.includes("const") ||
+                    code.includes("let") ||
+                    code.includes("var") ||
+                    code.includes("class") ||
+                    code.includes("interface") ||
+                    code.includes("type") ||
+                    code.includes("import") ||
+                    code.includes("export") ||
+                    code.includes("return") ||
+                    code.includes("if") ||
+                    code.includes("for") ||
+                    code.includes("while") ||
+                    code.includes("{") ||
+                    code.includes("}") ||
+                    code.includes("(") ||
+                    code.includes(")") ||
+                    code.includes("=") ||
+                    code.includes("=>") ||
+                    code.includes(";") ||
+                    code.includes("def ") ||
+                    code.includes("public ") ||
+                    code.includes("private ") ||
+                    code.includes("protected ")))
+            ) {
+                record("gemini_block", code);
+            }
+        }
+    }
+
+    const inlineCodeRe = /`([^`\n]{10,})`/g;
+    while ((match = inlineCodeRe.exec(text)) !== null) {
+        const code = match[1].trim();
+        if (
+            code.length > 10 &&
+            (code.includes("function") ||
+                code.includes("const") ||
+                code.includes("let") ||
+                code.includes("var") ||
+                code.includes("class") ||
+                code.includes("interface") ||
+                code.includes("type") ||
+                code.includes("import") ||
+                code.includes("export") ||
+                code.includes("return") ||
+                code.includes("if") ||
+                code.includes("for") ||
+                code.includes("while") ||
+                code.includes("{") ||
+                code.includes("}") ||
+                code.includes("(") ||
+                code.includes(")") ||
+                code.includes("=") ||
+                code.includes("=>") ||
+                code.includes(";"))
+        ) {
+            record("inline_code", code);
+        }
+    }
+
+    const suggestionKeywords = [
+        "suggest",
+        "recommend",
+        "propose",
+        "improve",
+        "fix",
+        "update",
+        "change",
+        "modify",
+        "should",
+        "could",
+        "would",
+    ];
+    const lines = text.split("\n");
+    let currentSuggestion = "";
+    let inSuggestion = false;
+
+    for (const line of lines) {
+        const lowerLine = line.toLowerCase();
+        if (
+            suggestionKeywords.some((keyword) => lowerLine.includes(keyword)) &&
+            (line.includes("```") ||
+                line.trim().startsWith("function") ||
+                line.trim().startsWith("const") ||
+                line.trim().startsWith("let") ||
+                line.trim().startsWith("var"))
+        ) {
+            inSuggestion = true;
+            currentSuggestion = line;
+        } else if (
+            inSuggestion &&
+            (line.trim() === "" || line.startsWith(" ") || line.startsWith("\t") || line.includes("```"))
+        ) {
+            if (line.includes("```")) {
+                inSuggestion = false;
+                if (currentSuggestion.trim().length > 0) {
+                    record("keyword_block", currentSuggestion.trim());
+                    currentSuggestion = "";
+                }
+            } else {
+                currentSuggestion += "\n" + line;
+            }
+        } else if (inSuggestion && line.trim() !== "") {
+            currentSuggestion += "\n" + line;
+        }
+    }
+
+    if (currentSuggestion.trim().length > 0) {
+        record("keyword_block", currentSuggestion.trim());
+    }
+
+    if (details.length === 0 && diffHunk) {
+        const addedLines = diffHunk
+            .split("\n")
+            .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+            .map((line) => line.substring(1))
+            .filter((line) => line.trim().length > 0);
+
+        if (addedLines.length > 0) {
+            record("diff_hunk", addedLines.join("\n"));
+        }
+    }
+
+    return {
+        suggestions: details.map((detail) => detail.content),
+        details,
+    };
+}
+
 /**
  * GET /api/stats
  * Dashboard statistics endpoint
@@ -3237,6 +3507,307 @@ app.get("/colby/best-practices", async (c: HonoContext) => {
         });
     } catch (error) {
         return c.json({ error: "Failed to fetch best practices" }, 500);
+    }
+});
+
+/**
+ * GET /colby/pr/:owner/:repo/:prNumber/comments
+ * Inspect PR comments with detected suggestions and /colby command triggers.
+ */
+app.get("/colby/pr/:owner/:repo/:prNumber/comments", async (c: HonoContext) => {
+    const owner = c.req.param("owner");
+    const repo = c.req.param("repo");
+    const prParam = c.req.param("prNumber");
+    const prNumber = Number(prParam);
+
+    if (!owner || !repo || !prParam || Number.isNaN(prNumber)) {
+        return c.json(
+            {
+                error: "Invalid parameters",
+                details: "Provide owner, repo, and a numeric pull request number.",
+            },
+            400,
+        );
+    }
+
+    const repoFullName = `${owner}/${repo}`;
+
+    try {
+        let eventsRows: any[] = [];
+        try {
+            const eventsResult = await c.env.DB.prepare(
+                `SELECT delivery_id, event, action, created_at, response_status, response_message, error_details, payload_json
+                 FROM gh_events
+                 WHERE repo = ? AND pr_number = ? AND event IN ('pull_request_review_comment', 'issue_comment', 'pull_request_review')
+                 ORDER BY created_at ASC`,
+            )
+                .bind(repoFullName, prNumber)
+                .all();
+            eventsRows = (eventsResult.results || []) as any[];
+        } catch (error) {
+            eventsRows = [];
+        }
+
+        const comments = eventsRows.map((row) => {
+            const payload = safeJsonParse<any>(row.payload_json, {});
+            const commentNode =
+                row.event === "pull_request_review_comment"
+                    ? payload.comment || null
+                    : row.event === "issue_comment"
+                    ? payload.comment || null
+                    : row.event === "pull_request_review"
+                    ? payload.review || null
+                    : null;
+
+            const body: string = commentNode?.body || "";
+            const diffHunk: string | null = commentNode?.diff_hunk || null;
+
+            const triggers = detectTriggersFromText(body);
+            const suggestionAnalysis = detectSuggestionsFromBody(body, diffHunk);
+
+            const colbyCommands = triggers
+                .filter((trigger) => trigger.toLowerCase().startsWith("/colby"))
+                .map((trigger) => {
+                    const parsed = parseColbyCommand(trigger.toLowerCase());
+                    return {
+                        raw: trigger,
+                        command: parsed.command,
+                        args: parsed.args,
+                    };
+                });
+
+            return {
+                deliveryId: row.delivery_id,
+                event: row.event,
+                action: row.action,
+                createdAt: row.created_at,
+                responseStatus: row.response_status,
+                responseMessage: row.response_message,
+                errorDetails: row.error_details,
+                commentId: commentNode?.id ?? null,
+                inReplyToId: commentNode?.in_reply_to_id ?? null,
+                user:
+                    commentNode?.user?.login ??
+                    payload.comment?.user?.login ??
+                    payload.review?.user?.login ??
+                    null,
+                body,
+                bodyPreview: body ? body.substring(0, 200) : "",
+                htmlUrl: commentNode?.html_url ?? payload.review?.html_url ?? null,
+                path: commentNode?.path ?? null,
+                line: commentNode?.line ?? null,
+                side: commentNode?.side ?? null,
+                diffHunk,
+                suggestions: suggestionAnalysis.suggestions,
+                suggestionDetails: suggestionAnalysis.details,
+                suggestionsCount: suggestionAnalysis.suggestions.length,
+                triggers,
+                colbyCommands,
+            };
+        });
+
+        const summary = {
+            totalEvents: comments.length,
+            reviewComments: comments.filter((c) => c.event === "pull_request_review_comment").length,
+            issueComments: comments.filter((c) => c.event === "issue_comment").length,
+            prReviews: comments.filter((c) => c.event === "pull_request_review").length,
+            commentsWithSuggestions: comments.filter((c) => c.suggestionsCount > 0).length,
+            commentsWithCommands: comments.filter((c) => c.colbyCommands.length > 0).length,
+        };
+
+        return c.json({
+            repo: repoFullName,
+            prNumber,
+            summary,
+            comments,
+        });
+    } catch (error) {
+        return c.json(
+            {
+                error: "Failed to load PR comment diagnostics",
+                details: error instanceof Error ? error.message : String(error),
+            },
+            500,
+        );
+    }
+});
+
+/**
+ * GET /colby/pr/:owner/:repo/:prNumber/commands
+ * Summarize /colby command executions and operation progress for a PR.
+ */
+app.get("/colby/pr/:owner/:repo/:prNumber/commands", async (c: HonoContext) => {
+    const owner = c.req.param("owner");
+    const repo = c.req.param("repo");
+    const prParam = c.req.param("prNumber");
+    const prNumber = Number(prParam);
+
+    if (!owner || !repo || !prParam || Number.isNaN(prNumber)) {
+        return c.json(
+            {
+                error: "Invalid parameters",
+                details: "Provide owner, repo, and a numeric pull request number.",
+            },
+            400,
+        );
+    }
+
+    const repoFullName = `${owner}/${repo}`;
+
+    try {
+        let commandRows: any[] = [];
+        try {
+            const commandResult = await c.env.DB.prepare(
+                `SELECT id, delivery_id, repo, pr_number, author, command, command_args, status, result_data, error_message, started_at, completed_at, created_at
+                 FROM colby_commands
+                 WHERE repo = ? AND pr_number = ?
+                 ORDER BY created_at DESC`,
+            )
+                .bind(repoFullName, prNumber)
+                .all();
+            commandRows = (commandResult.results || []) as any[];
+        } catch (error) {
+            commandRows = [];
+        }
+
+        const commands = commandRows.map((row: any) => {
+            const commandArgs = safeJsonParse<Record<string, unknown> | null>(row.command_args, null);
+            const resultData = safeJsonParse<Record<string, unknown> | null>(row.result_data, null);
+
+            return {
+                id: row.id,
+                deliveryId: row.delivery_id,
+                repo: row.repo,
+                prNumber: row.pr_number,
+                author: row.author,
+                command: row.command,
+                status: row.status,
+                commandArgs,
+                resultData,
+                errorMessage: row.error_message || null,
+                startedAt: row.started_at,
+                completedAt: row.completed_at,
+                createdAt: row.created_at,
+            };
+        });
+
+        const summaryRecord: Record<
+            string,
+            {
+                total: number;
+                lastStatus: string | null;
+                lastRunAt: number | null;
+                lastDeliveryId: string | null;
+                lastArgs: Record<string, unknown> | null;
+                lastResult: Record<string, unknown> | null;
+                lastError: string | null;
+            }
+        > = {};
+
+        for (const commandName of KNOWN_COLBY_COMMANDS) {
+            summaryRecord[commandName] = {
+                total: 0,
+                lastStatus: null,
+                lastRunAt: null,
+                lastDeliveryId: null,
+                lastArgs: null,
+                lastResult: null,
+                lastError: null,
+            };
+        }
+
+        for (const entry of commands) {
+            const key = entry.command || "unknown";
+            if (!summaryRecord[key]) {
+                summaryRecord[key] = {
+                    total: 0,
+                    lastStatus: null,
+                    lastRunAt: null,
+                    lastDeliveryId: null,
+                    lastArgs: null,
+                    lastResult: null,
+                    lastError: null,
+                };
+            }
+            summaryRecord[key].total += 1;
+
+            if (
+                summaryRecord[key].lastRunAt === null ||
+                (typeof entry.createdAt === "number" && entry.createdAt > summaryRecord[key].lastRunAt)
+            ) {
+                summaryRecord[key].lastRunAt = typeof entry.createdAt === "number" ? entry.createdAt : summaryRecord[key].lastRunAt;
+                summaryRecord[key].lastStatus = entry.status;
+                summaryRecord[key].lastDeliveryId = entry.deliveryId;
+                summaryRecord[key].lastArgs = entry.commandArgs;
+                summaryRecord[key].lastResult = entry.resultData;
+                summaryRecord[key].lastError = entry.errorMessage;
+            }
+        }
+
+        let operationRows: any[] = [];
+        try {
+            const operationsResult = await c.env.DB.prepare(
+                `SELECT operation_id, operation_type, status, progress_percent, current_step, result_data, error_message, repo, pr_number, created_at, updated_at
+                 FROM operation_progress
+                 WHERE repo = ? AND (pr_number = ? OR pr_number IS NULL)
+                 ORDER BY created_at DESC`,
+            )
+                .bind(repoFullName, prNumber)
+                .all();
+            operationRows = (operationsResult.results || []) as any[];
+        } catch (error) {
+            operationRows = [];
+        }
+
+        const operations = operationRows.map((row: any) => ({
+            operationId: row.operation_id,
+            type: row.operation_type,
+            status: row.status,
+            progressPercent: row.progress_percent,
+            currentStep: row.current_step,
+            repo: row.repo,
+            prNumber: row.pr_number,
+            resultData: safeJsonParse<Record<string, unknown> | null>(row.result_data, null),
+            errorMessage: row.error_message || null,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+        }));
+
+        const summary = Object.entries(summaryRecord).map(([commandName, data]) => ({
+            command: commandName,
+            totalRuns: data.total,
+            lastStatus: data.lastStatus,
+            lastRunAt: data.lastRunAt,
+            lastDeliveryId: data.lastDeliveryId,
+            lastArgs: data.lastArgs,
+            lastResult: data.lastResult,
+            lastError: data.lastError,
+        }));
+
+        const missingCommands = summary
+            .filter((item) => item.totalRuns === 0)
+            .map((item) => item.command);
+
+        return c.json({
+            repo: repoFullName,
+            prNumber,
+            totals: {
+                commandsExecuted: commands.length,
+                operationsTracked: operations.length,
+            },
+            summary,
+            missingCommands,
+            commands,
+            operations,
+        });
+    } catch (error) {
+        return c.json(
+            {
+                error: "Failed to load PR command diagnostics",
+                details: error instanceof Error ? error.message : String(error),
+            },
+            500,
+        );
     }
 });
 
