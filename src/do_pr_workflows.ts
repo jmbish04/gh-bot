@@ -502,10 +502,10 @@ export class PrWorkflow {
               .filter((line: string) => line.startsWith('+') && !line.startsWith('+++'))
               .map((line: string) => line.substring(1)) // Remove the + prefix
               .filter((line: string) => line.trim().length > 0)
-            
+
             if (addedLines.length > 0) {
-              suggestions = addedLines
-              console.log(`[DO] Extracted ${suggestions.length} suggestions from diff_hunk for comment ${comment.id}`)
+              suggestions = [addedLines.join('\n')]
+              console.log(`[DO] Extracted fallback suggestion block from diff_hunk (${addedLines.length} line(s)) for comment ${comment.id}`)
             }
           }
 

@@ -22,34 +22,70 @@ export async function buildFileChangesFromSuggestions(args: BuildArgs): Promise<
   if (!original) return {}
 
   const beforeSpan = extractBeforeSpanFromHunk(diffHunk)
-  if (!beforeSpan) return {}
+  const addedSpan = extractAddedSpanFromHunk(diffHunk)
+  const candidateSpans = [beforeSpan, addedSpan].filter((span): span is string => Boolean(span))
+
+  if (candidateSpans.length === 0) {
+    // If this is a brand new file (no before context) fall back to writing the suggestion content directly
+    if (original.trim().length === 0 && suggestions.length > 0) {
+      const combined = suggestions
+        .map(s => s.replace(/\r\n/g, '\n').replace(/\n$/, ''))
+        .join('\n\n')
+      if (combined.trim().length > 0) {
+        return { [filePath]: combined }
+      }
+    }
+    return {}
+  }
 
   let updated = original
   let applied = 0
 
   for (const suggestion of suggestions) {
     // Normalize newlines
-    const cleanBefore = beforeSpan.replace(/\r\n/g, '\n').trimEnd()
     const cleanSuggestion = suggestion.replace(/\r\n/g, '\n').replace(/\n$/, '') // GitHub suggestions often end with newline
 
-    // Try exact match first
-    if (updated.includes(cleanBefore)) {
-      updated = updated.replace(cleanBefore, cleanSuggestion)
-      applied++
-      continue
+    let replaced = false
+
+    for (const candidate of candidateSpans) {
+      const cleanBefore = candidate.replace(/\r\n/g, '\n').trimEnd()
+      if (!cleanBefore) continue
+
+      // Try exact match first
+      if (updated.includes(cleanBefore)) {
+        updated = updated.replace(cleanBefore, cleanSuggestion)
+        applied++
+        replaced = true
+        break
+      }
+
+      // Fallback: looser match on whitespace
+      const loose = collapseWs(cleanBefore)
+      const updatedLoose = collapseWs(updated)
+      if (loose && updatedLoose.indexOf(loose) >= 0) {
+        // Too messy to splice accurately in loose form; skip to avoid corruption
+        continue
+      }
     }
-    // Fallback: looser match on whitespace
-    const loose = collapseWs(cleanBefore)
-    const updatedLoose = collapseWs(updated)
-    const idx = updatedLoose.indexOf(loose)
-    if (idx >= 0) {
-      // Too messy to splice accurately in loose form; skip to avoid corruption
-      continue
+
+    // For truly new files with no replaceable span, fall back to writing the suggestion content
+    if (!replaced && original.trim().length === 0 && cleanSuggestion.trim().length > 0) {
+      updated = cleanSuggestion
+      applied++
     }
   }
 
   if (applied > 0 && updated !== original) {
     return { [filePath]: updated }
+  }
+
+  if (original.trim().length === 0 && suggestions.length > 0) {
+    const combined = suggestions
+      .map(s => s.replace(/\r\n/g, '\n').replace(/\n$/, ''))
+      .join('\n\n')
+    if (combined.trim().length > 0) {
+      return { [filePath]: combined }
+    }
   }
   return {}
 }
@@ -74,5 +110,15 @@ function extractBeforeSpanFromHunk(hunk: string): string | null {
     }
   }
   const txt = content.join('\n').trimEnd()
+  return txt.length ? txt : null
+}
+
+function extractAddedSpanFromHunk(hunk: string): string | null {
+  if (!hunk) return null
+  const lines = hunk.split('\n')
+  const added = lines
+    .filter(ln => ln.startsWith('+') && !ln.startsWith('+++'))
+    .map(ln => ln.slice(1))
+  const txt = added.join('\n').trimEnd()
   return txt.length ? txt : null
 }

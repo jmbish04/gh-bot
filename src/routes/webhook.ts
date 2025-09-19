@@ -446,10 +446,10 @@ async function onReviewComment(env: Env, delivery: string, p: any, startTime: nu
       .filter((line: string) => line.startsWith('+') && !line.startsWith('+++'))
       .map((line: string) => line.substring(1)) // Remove the + prefix
       .filter((line: string) => line.trim().length > 0)
-    
+
     if (addedLines.length > 0) {
-      suggestions = addedLines
-      console.log(`[WEBHOOK] Extracted ${suggestions.length} suggestions from diff_hunk`)
+      suggestions = [addedLines.join('\n')]
+      console.log(`[WEBHOOK] Extracted fallback suggestion block from diff_hunk with ${addedLines.length} line(s)`)
     }
   }
   
