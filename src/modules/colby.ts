@@ -1,5 +1,6 @@
 // src/modules/colby.ts
 import { ghREST } from './github_helpers'
+import { broadcastCommandStatus } from './command_status_ws'
 
 type Env = {
   DB: D1Database
@@ -47,11 +48,30 @@ export async function createColbyCommand(env: Env, cmd: Omit<ColbyCommand, 'id'>
       cmd.errorMessage || null
     ).run()
 
-    return result.meta?.last_row_id as number
+    const commandId = result.meta?.last_row_id as number
+    broadcastCommandStatus({
+      commandId: String(commandId),
+      status: cmd.status,
+      message: typeof cmd.resultData?.message === 'string' ? cmd.resultData.message : undefined,
+      error: cmd.errorMessage,
+      resultData: cmd.resultData,
+      timestamp: new Date().toISOString()
+    })
+
+    return commandId
   } catch (error) {
     console.log('Failed to create colby command (table may not exist):', error)
     // Return a dummy ID to allow the flow to continue
-    return Date.now()
+    const fallbackId = Date.now()
+    broadcastCommandStatus({
+      commandId: String(fallbackId),
+      status: cmd.status,
+      message: typeof cmd.resultData?.message === 'string' ? cmd.resultData.message : undefined,
+      error: cmd.errorMessage,
+      resultData: cmd.resultData,
+      timestamp: new Date().toISOString()
+    })
+    return fallbackId
   }
 }
 
@@ -93,6 +113,35 @@ export async function updateColbyCommand(env: Env, id: number, updates: Partial<
   } catch (error) {
     console.log('Failed to update colby command (table may not exist):', error)
   }
+
+  const resultData = updates.resultData
+  let message: string | undefined
+  if (typeof updates.errorMessage === 'string' && updates.errorMessage.trim()) {
+    message = updates.errorMessage
+  } else if (resultData && typeof resultData === 'object') {
+    const maybeMessage = (resultData as Record<string, unknown>).message
+    if (typeof maybeMessage === 'string') {
+      message = maybeMessage
+    }
+  }
+
+  let progress: number | undefined
+  if (resultData && typeof resultData === 'object') {
+    const maybeProgress = (resultData as Record<string, unknown>).progress
+    if (typeof maybeProgress === 'number') {
+      progress = maybeProgress
+    }
+  }
+
+  broadcastCommandStatus({
+    commandId: String(id),
+    status: updates.status,
+    progress,
+    message,
+    error: updates.errorMessage,
+    resultData: updates.resultData,
+    timestamp: new Date().toISOString()
+  })
 }
 
 /**
