@@ -75,6 +75,7 @@ import { UserPreferencesManager } from "./modules/user_preferences";
 import { handleWebhook } from "./routes/webhook";
 import { asyncGeneratorToStream } from "./stream";
 import { parseColbyCommand } from "./modules/colby";
+import { setupCommandStatusSocket } from "./modules/command_status_ws";
 
 /**
  * Runtime bindings available to this Worker.
@@ -127,7 +128,7 @@ app.options("*", () => new Response(null, { headers: CORS_HEADERS }));
 
 /**
  * GET /ws
- * WebSocket echo endpoint for realtime communication.
+ * WebSocket endpoint for unified Colby command status updates.
  */
 app.get("/ws", (c: HonoContext) => {
         if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") {
@@ -135,12 +136,7 @@ app.get("/ws", (c: HonoContext) => {
         }
         const pair = new WebSocketPair();
         const { 0: client, 1: server } = pair;
-        server.accept();
-        server.addEventListener("message", (event) => {
-                server.send(event.data);
-        });
-        server.addEventListener("close", () => console.log("WebSocket closed"));
-        server.addEventListener("error", (err) => console.error("WebSocket error", err));
+        setupCommandStatusSocket(server);
         return new Response(null, { status: 101, webSocket: client });
 });
 
@@ -2806,7 +2802,8 @@ function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
         const code = match[1].trim();
         if (
             code.length > 5 &&
-            (code.includes("function") ||
+            (
+                code.includes("function") ||
                 code.includes("const") ||
                 code.includes("let") ||
                 code.includes("var") ||
@@ -2829,7 +2826,8 @@ function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
                 code.includes("def ") ||
                 code.includes("public ") ||
                 code.includes("private ") ||
-                code.includes("protected ")))
+                code.includes("protected ")
+            )
         ) {
             record("ai_code_block", code);
         }
@@ -2844,7 +2842,8 @@ function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
             const code = match[1].trim();
             if (
                 code.length > 10 &&
-                (code.includes("function") ||
+                (
+                    code.includes("function") ||
                     code.includes("const") ||
                     code.includes("let") ||
                     code.includes("var") ||
@@ -2867,7 +2866,8 @@ function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
                     code.includes("def ") ||
                     code.includes("public ") ||
                     code.includes("private ") ||
-                    code.includes("protected ")))
+                    code.includes("protected ")
+                )
             ) {
                 record("gemini_block", code);
             }
@@ -2879,7 +2879,8 @@ function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
         const code = match[1].trim();
         if (
             code.length > 10 &&
-            (code.includes("function") ||
+            (
+                code.includes("function") ||
                 code.includes("const") ||
                 code.includes("let") ||
                 code.includes("var") ||
@@ -2898,7 +2899,8 @@ function detectSuggestionsFromBody(body: string, diffHunk?: string | null): {
                 code.includes(")") ||
                 code.includes("=") ||
                 code.includes("=>") ||
-                code.includes(";"))
+                code.includes(";")
+            )
         ) {
             record("inline_code", code);
         }
