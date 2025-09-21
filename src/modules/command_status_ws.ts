@@ -57,19 +57,6 @@ function subscribeToCommand(socket: WebSocket, commandId: string) {
   socketSubscriptions.set(socket, commandId)
 }
 
-function unsubscribe(socket: WebSocket) {
-  const existing = socketSubscriptions.get(socket)
-  if (!existing) {
-    return
-  }
-  const sockets = commandSubscriptions.get(existing)
-  sockets?.delete(socket)
-  if (sockets && sockets.size === 0) {
-    commandSubscriptions.delete(existing)
-  }
-  socketSubscriptions.delete(socket)
-}
-
 function parseMessageData(data: unknown): string {
   if (typeof data === 'string') {
     return data
@@ -131,7 +118,7 @@ export function setupCommandStatusSocket(socket: WebSocket) {
     }
 
     if (action === 'unsubscribe') {
-      unsubscribe(socket)
+      cleanupSocket(socket)
       safeSend(socket, {
         type: 'unsubscribed'
       })
@@ -145,7 +132,6 @@ export function setupCommandStatusSocket(socket: WebSocket) {
   })
 
   const closeHandler = () => {
-    unsubscribe(socket)
     cleanupSocket(socket)
   }
 
