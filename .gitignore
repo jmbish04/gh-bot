@@ -212,7 +212,7 @@ dist/
 
 # Gatsby
 .cache/
-public/
+# public/ - commented out as we use public/ for Cloudflare Workers static assets
 
 # Storybook
 .out
