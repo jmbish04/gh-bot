@@ -169,7 +169,7 @@ Validates:
 - ✅ Build includes MCP tools module
 - ✅ Migration creates all required tables
 - ✅ Default tools match requirements
-- ✅ 7 webhook handlers integrated
+- ✅ 6 webhook handlers integrated
 - ✅ Comprehensive logging implemented
 - ✅ Error handling prevents failures
 

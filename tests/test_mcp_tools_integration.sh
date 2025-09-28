@@ -6,10 +6,12 @@
 echo "🧪 Starting MCP Tools Integration Tests..."
 echo "========================================="
 
+# Change to script directory
+cd "$(dirname "$0")/.."
+
 # Test 1: Validate build includes MCP tools module
 echo ""
 echo "🔧 Test 1: Building project with MCP tools integration..."
-cd /home/runner/work/gh-bot/gh-bot
 if npm run build > /dev/null 2>&1; then
   echo "✅ Build successful - MCP tools module integrated properly"
 else
@@ -61,7 +63,7 @@ fi
 # Test 4: Check webhook integration
 echo ""
 echo "🪝 Test 4: Validating webhook MCP tools integration..."
-if grep -q "ensureRepoMcpTools" src/routes/webhook.ts; then
+if grep -q "handleMcpToolsForRepo" src/routes/webhook.ts; then
   echo "✅ Webhook calls MCP tools setup function"
 else
   echo "❌ Webhook missing MCP tools integration"
@@ -69,7 +71,7 @@ else
 fi
 
 # Count the number of event handlers that include MCP setup
-mcp_integrations=$(grep -c "ensureRepoMcpTools" src/routes/webhook.ts)
+mcp_integrations=$(grep -c "await handleMcpToolsForRepo" src/routes/webhook.ts)
 echo "✅ MCP tools integrated into $mcp_integrations webhook handlers"
 
 # Test 5: Check logging implementation
@@ -93,8 +95,8 @@ fi
 echo ""
 echo "⚙️ Test 6: Checking MCP tools configuration compliance..."
 
-# Check for browser automation tools
-required_tools=("browser_navigate" "browser_click" "browser_type" "browser_take_screenshot" "browser_snapshot")
+# Check for browser automation tools (expanded list for better coverage)
+required_tools=("browser_navigate" "browser_click" "browser_type" "browser_take_screenshot" "browser_snapshot" "browser_close" "browser_resize" "browser_drag" "browser_hover" "browser_wait_for")
 for tool in "${required_tools[@]}"; do
   if grep -q "\"$tool\"" src/modules/mcp_tools.ts; then
     echo "✅ Found required tool: $tool"

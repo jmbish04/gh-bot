@@ -81,6 +81,11 @@ export const DEFAULT_MCP_TOOLS: McpToolsConfig = {
   }
 }
 
+interface DbToolRecord {
+  tool_name: string
+  tool_config: string
+}
+
 /**
  * Gets active default MCP tools from the database
  */
@@ -90,16 +95,15 @@ export async function getDefaultMcpTools(db: D1Database): Promise<McpToolsConfig
       SELECT tool_name, tool_config
       FROM default_mcp_tools 
       WHERE is_active = 1
-    `).all()
+    `).all<DbToolRecord>()
 
     const mcpServers: Record<string, McpServerConfig> = {}
     
-    for (const row of results.results) {
-      const record = row as any
+    for (const row of results.results ?? []) {
       try {
-        mcpServers[record.tool_name] = JSON.parse(record.tool_config)
+        mcpServers[row.tool_name] = JSON.parse(row.tool_config)
       } catch (error) {
-        console.warn(`[MCP_TOOLS] Failed to parse config for tool ${record.tool_name}:`, error)
+        console.warn(`[MCP_TOOLS] Failed to parse config for tool ${row.tool_name}:`, error)
       }
     }
 
@@ -120,20 +124,19 @@ export async function getRepoMcpTools(db: D1Database, repo: string): Promise<Mcp
       SELECT tool_name, tool_config
       FROM repo_mcp_tools 
       WHERE repo = ? AND is_active = 1
-    `).bind(repo).all()
+    `).bind(repo).all<DbToolRecord>()
 
-    if (!results.results.length) {
+    if (!results.results?.length) {
       return null // No MCP tools configured for this repo
     }
 
     const mcpServers: Record<string, McpServerConfig> = {}
     
     for (const row of results.results) {
-      const record = row as any
       try {
-        mcpServers[record.tool_name] = JSON.parse(record.tool_config)
+        mcpServers[row.tool_name] = JSON.parse(row.tool_config)
       } catch (error) {
-        console.warn(`[MCP_TOOLS] Failed to parse config for repo ${repo} tool ${record.tool_name}:`, error)
+        console.warn(`[MCP_TOOLS] Failed to parse config for repo ${repo} tool ${row.tool_name}:`, error)
       }
     }
 
@@ -141,6 +144,22 @@ export async function getRepoMcpTools(db: D1Database, repo: string): Promise<Mcp
   } catch (error) {
     console.error(`[MCP_TOOLS] Error getting MCP tools for repo ${repo}:`, error)
     return null
+  }
+}
+
+/**
+ * Gets MCP tool names for a repository (more efficient than getting full configs)
+ */
+async function getRepoMcpToolNames(db: D1Database, repo: string): Promise<string[]> {
+  try {
+    const results = await db.prepare(`
+      SELECT tool_name FROM repo_mcp_tools WHERE repo = ? AND is_active = 1
+    `).bind(repo).all<{tool_name: string}>()
+    
+    return results.results?.map(r => r.tool_name) ?? []
+  } catch (error) {
+    console.error(`[MCP_TOOLS] Error getting tool names for repo ${repo}:`, error)
+    return []
   }
 }
 
@@ -180,13 +199,15 @@ export async function setupDefaultMcpTools(
     // Insert each default tool for this repository
     for (const [toolName, toolConfig] of Object.entries(defaultTools.mcpServers)) {
       try {
-        await db.prepare(`
+        const result = await db.prepare(`
           INSERT OR IGNORE INTO repo_mcp_tools 
           (repo, tool_name, tool_config, source, is_active)
           VALUES (?, ?, ?, 'default', 1)
         `).bind(repo, toolName, JSON.stringify(toolConfig)).run()
         
-        toolsAdded.push(toolName)
+        if (result.changes && result.changes > 0) {
+          toolsAdded.push(toolName)
+        }
       } catch (error) {
         console.warn(`[MCP_TOOLS] Failed to add tool ${toolName} for repo ${repo}:`, error)
       }
@@ -243,31 +264,30 @@ export async function ensureRepoMcpTools(
   const startTime = Date.now()
 
   try {
-    // Check if repo already has MCP tools
-    const existingTools = await getRepoMcpTools(db, repo)
+    // Check if repo already has MCP tools (more efficient check)
+    const existingToolNames = await getRepoMcpToolNames(db, repo)
     
-    if (existingTools && Object.keys(existingTools.mcpServers).length > 0) {
+    if (existingToolNames.length > 0) {
       // Repository already has MCP tools configured - don't modify
-      const toolNames = Object.keys(existingTools.mcpServers)
       const processingTime = Date.now() - startTime
 
       await logMcpOperation(db, {
         repo,
         operation: 'check',
         operation_details: JSON.stringify({
-          found_tools: toolNames.length,
+          found_tools: existingToolNames.length,
           action: 'skipped_existing_config'
         }),
-        tools_found: JSON.stringify(toolNames),
+        tools_found: JSON.stringify(existingToolNames),
         status: 'success',
         processing_time_ms: processingTime,
         triggered_by: 'webhook_event',
         event_type: eventType
       })
 
-      console.log(`[MCP_TOOLS] Repo ${repo} already has ${toolNames.length} MCP tools configured - skipping setup`)
+      console.log(`[MCP_TOOLS] Repo ${repo} already has ${existingToolNames.length} MCP tools configured - skipping setup`)
       
-      return { action: 'skip', toolsFound: toolNames }
+      return { action: 'skip', toolsFound: existingToolNames }
     }
 
     // No MCP tools found - set up defaults
@@ -339,9 +359,13 @@ export async function updateDefaultMcpTool(
 ): Promise<boolean> {
   try {
     await db.prepare(`
-      INSERT OR REPLACE INTO default_mcp_tools 
-      (tool_name, tool_config, description, is_active, updated_at)
-      VALUES (?, ?, ?, 1, ?)
+      INSERT INTO default_mcp_tools (tool_name, tool_config, description, is_active, updated_at)
+      VALUES (?1, ?2, ?3, 1, ?4)
+      ON CONFLICT(tool_name) DO UPDATE SET
+        tool_config = excluded.tool_config,
+        description = excluded.description,
+        is_active = excluded.is_active,
+        updated_at = excluded.updated_at
     `).bind(
       toolName, 
       JSON.stringify(toolConfig), 
@@ -364,7 +388,7 @@ export async function getMcpToolsLogs(
   db: D1Database,
   repo: string,
   limit: number = 50
-): Promise<any[]> {
+): Promise<McpOperationLog[]> {
   try {
     const results = await db.prepare(`
       SELECT *
@@ -372,9 +396,9 @@ export async function getMcpToolsLogs(
       WHERE repo = ?
       ORDER BY created_at DESC
       LIMIT ?
-    `).bind(repo, limit).all()
+    `).bind(repo, limit).all<McpOperationLog>()
 
-    return results.results
+    return results.results ?? []
   } catch (error) {
     console.error(`[MCP_TOOLS] Error getting logs for repo ${repo}:`, error)
     return []

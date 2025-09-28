@@ -100,24 +100,7 @@ INSERT OR IGNORE INTO default_mcp_tools (tool_name, tool_config, description) VA
     'Cloudflare documentation MCP server for accessing official docs'
 );
 
--- Add triggers to update updated_at timestamps
-CREATE TRIGGER IF NOT EXISTS update_default_mcp_tools_timestamp
-    AFTER UPDATE ON default_mcp_tools
-    FOR EACH ROW
-BEGIN
-    UPDATE default_mcp_tools
-    SET updated_at = strftime('%s', 'now') * 1000
-    WHERE id = NEW.id;
-END;
-
-CREATE TRIGGER IF NOT EXISTS update_repo_mcp_tools_timestamp
-    AFTER UPDATE ON repo_mcp_tools
-    FOR EACH ROW
-BEGIN
-    UPDATE repo_mcp_tools
-    SET updated_at = strftime('%s', 'now') * 1000
-    WHERE id = NEW.id;
-END;
+-- Note: updated_at timestamps are managed by application logic to avoid trigger complications
 
 -- Views for common queries
 
