@@ -1,5 +1,25 @@
 // src/routes/webhook.ts
 import { verify as verifySignature } from '@octokit/webhooks-methods'
+import { ensureRepoMcpTools } from '../modules/mcp_tools'
+
+/**
+ * Helper function to handle MCP tools setup for any repository event
+ */
+async function handleMcpToolsForRepo(db: D1Database, repo: string, eventType: string): Promise<void> {
+  try {
+    const mcpResult = await ensureRepoMcpTools(db, repo, eventType)
+    if (mcpResult.action === 'setup' && mcpResult.toolsAdded) {
+      console.log(`[WEBHOOK] Set up ${mcpResult.toolsAdded.length} default MCP tools for repository ${repo}:`, mcpResult.toolsAdded)
+    } else if (mcpResult.action === 'skip' && mcpResult.toolsFound) {
+      console.log(`[WEBHOOK] Repository ${repo} already has ${mcpResult.toolsFound.length} MCP tools configured`)
+    }
+    if (mcpResult.error) {
+      console.error(`[WEBHOOK] Error setting up MCP tools for repository ${repo}:`, mcpResult.error)
+    }
+  } catch (error) {
+    console.error(`[WEBHOOK] Failed to process MCP tools for repository ${repo}:`, error)
+  }
+}
 
 type Env = {
   DB: D1Database
@@ -425,6 +445,9 @@ async function onReviewComment(env: Env, delivery: string, p: any, startTime: nu
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
 
+  // Check and setup MCP tools for the repository
+  await handleMcpToolsForRepo(env.DB, repo, 'pull_request_review_comment')
+
   // Check if this is a new repository and trigger research sweep
   const isNew = await isNewRepository(env, repo)
   if (isNew) {
@@ -537,6 +560,9 @@ async function onPRReview(env: Env, delivery: string, p: any, startTime: number)
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
 
+  // Check and setup MCP tools for the repository
+  await handleMcpToolsForRepo(env.DB, repo, 'pull_request_review')
+
   const body: string = p.review.body || ''
   const suggestions = extractSuggestions(body)
   const triggers = parseTriggers(body)
@@ -584,6 +610,9 @@ async function onIssueOpened(env: Env, delivery: string, p: any, startTime: numb
   if (p.issue.user.type === 'Bot') return new Response('bot ignored', { status: 200 })
 
   await updateEventMeta(env, delivery, repo, null, author, action)
+
+  // Check and setup MCP tools for the repository
+  await handleMcpToolsForRepo(env.DB, repo, 'issues')
 
   const body: string = p.issue.body || ''
   const suggestions = extractSuggestions(body)
@@ -662,6 +691,9 @@ async function onIssueComment(env: Env, delivery: string, p: any, startTime: num
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
 
+  // Check and setup MCP tools for the repository  
+  await handleMcpToolsForRepo(env.DB, repo, 'issue_comment')
+
   const body: string = p.comment.body || ''
   const triggers = parseTriggers(body)
 
@@ -708,6 +740,9 @@ async function onPullRequest(env: Env, delivery: string, p: any, startTime: numb
   const action = p.action
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
+
+  // Check and setup MCP tools for the repository
+  await handleMcpToolsForRepo(env.DB, repo, 'pull_request')
 
   // Check if this is a new repository and trigger research sweep
   const isNew = await isNewRepository(env, repo)
@@ -772,6 +807,9 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
     repositoryName: p.repository.name,
     owner: p.repository.owner.login
   })
+
+  // Check and setup MCP tools for the repository
+  await handleMcpToolsForRepo(env.DB, repo, 'repository_created')
 
   // Check if this is a new repository and trigger research sweep
   const isNew = await isNewRepository(env, repo)
