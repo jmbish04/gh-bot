@@ -112,19 +112,27 @@ const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
 	"Access-Control-Allow-Headers": "Content-Type, Authorization",
-	"Content-Type": "application/json",
 };
 
-// Apply CORS headers to all responses
+// Apply CORS headers to all responses, but preserve existing content-type
 app.use("*", async (c, next) => {
 	await next();
 	for (const [k, v] of Object.entries(CORS_HEADERS)) {
 		c.res.headers.set(k, v);
 	}
+	// Only set JSON content-type if no content-type is already set
+	if (!c.res.headers.get("Content-Type")) {
+		c.res.headers.set("Content-Type", "application/json");
+	}
 });
 
 // Handle preflight requests
-app.options("*", () => new Response(null, { headers: CORS_HEADERS }));
+app.options("*", () => new Response(null, { 
+	headers: {
+		...CORS_HEADERS,
+		"Content-Type": "application/json"
+	}
+}));
 
 /**
  * GET /ws
@@ -3954,14 +3962,20 @@ app.post("/api/repo/:owner/:repo/feedback", async (c: HonoContext) => {
  * Returns the comprehensive API specification from static file
  */
 app.get("/openapi.json", async (c: HonoContext) => {
-    // Serve the static OpenAPI specification file
+    // Serve the static OpenAPI specification file from assets
     try {
-        const response = await fetch("https://raw.githubusercontent.com/jmbish04/gh-bot/master/openapi.json");
+        const response = await c.env.ASSETS.fetch(new URL("/openapi.json", c.req.url));
         if (!response.ok) {
             throw new Error(`Failed to fetch OpenAPI spec: ${response.status}`);
         }
-                const spec: any = await response.json();
-                return c.json(spec);
+        // Forward the response from assets binding with proper content-type
+        return new Response(response.body, {
+            status: response.status,
+            headers: {
+                "Content-Type": "application/json",
+                ...Object.fromEntries([...response.headers])
+            }
+        });
     } catch (error) {
         console.error("Error loading OpenAPI spec:", error);
         return c.json({ error: "Failed to load OpenAPI specification" }, 500);
