@@ -60,6 +60,13 @@ else
   exit 1
 fi
 
+if grep -q "github-copilot-mcp" migrations/0009_github_copilot_mcp.sql; then
+  echo "✅ GitHub Copilot MCP server seeded in migration"
+else
+  echo "❌ Missing GitHub Copilot MCP server seed"
+  exit 1
+fi
+
 # Test 4: Check webhook integration
 echo ""
 echo "🪝 Test 4: Validating webhook MCP tools integration..."
@@ -111,6 +118,13 @@ if grep -q "search_cloudflare_documentation" src/modules/mcp_tools.ts; then
   echo "✅ Found required docs tool: search_cloudflare_documentation"
 else
   echo "❌ Missing required docs tool"
+  exit 1
+fi
+
+if grep -q "github-copilot-mcp" src/modules/mcp_tools.ts; then
+  echo "✅ GitHub Copilot MCP server present in defaults"
+else
+  echo "❌ Missing GitHub Copilot MCP server in defaults"
   exit 1
 fi
 

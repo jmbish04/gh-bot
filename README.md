@@ -21,6 +21,7 @@ A sophisticated Cloudflare Worker that provides AI-powered GitHub workflow autom
 - **Repository Discovery**: Automatically discovers and indexes repositories from GitHub App installations
 - **AI Analysis**: Comprehensive repository analysis using Workers AI
 - **Command Tracking**: Tracks and manages GitHub commands and operations
+- **GitHub Copilot MCP Workspace**: SSE-based MCP server that shares configs, instructions, questions, and task state with GitHub Copilot tools
 
 ### 📊 Research & Analytics
 - **Repository Research**: Automated research orchestration across multiple repositories
