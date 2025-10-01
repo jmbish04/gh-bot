@@ -322,7 +322,7 @@ app.post("/mcp/github-copilot/tool", async (c: HonoContext) => {
     } catch (error) {
         console.error("[MCP] Tool invocation failed", error);
         const message = error instanceof Error ? error.message : "Unknown error";
-        return c.json({ ok: false, error: message }, 400);
+        return c.json({ error: message }, 500);
     }
 });
 
