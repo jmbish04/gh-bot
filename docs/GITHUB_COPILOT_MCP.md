@@ -47,6 +47,6 @@ The MCP server also surfaces recent `agent_generation_requests` and `infrastruct
 ## Extending the Workspace
 - Add new instruction documents by inserting records into `copilot_instructions`.
 - Register additional configuration keys in `copilot_configs` to make them queryable by Copilot.
-- Extend task automation by inserting new sources into `copilot_task_links` or joining additional system tables inside `listTasks`.
+- Extend task automation by inserting new sources into `copilot_task_links` or joining additional system tables inside `fetchCopilotTasks`.
 - Update the default MCP server payload inside `migrations/0009_github_copilot_mcp.sql` (and `DEFAULT_MCP_TOOLS` in `src/modules/mcp_tools.ts`) if you deploy the Worker to a different hostname.
 
