@@ -3968,14 +3968,10 @@ app.get("/openapi.json", async (c: HonoContext) => {
         if (!response.ok) {
             throw new Error(`Failed to fetch OpenAPI spec: ${response.status}`);
         }
-        // Forward the response from assets binding with proper content-type
-        return new Response(response.body, {
-            status: response.status,
-            headers: {
-                "Content-Type": "application/json",
-                ...Object.fromEntries([...response.headers])
-            }
-        });
+        // The response from c.env.ASSETS.fetch will have the correct
+        // Content-Type, and the CORS middleware will add CORS headers without
+        // overriding it. We can return the response directly.
+        return response;
     } catch (error) {
         console.error("Error loading OpenAPI spec:", error);
         return c.json({ error: "Failed to load OpenAPI specification" }, 500);
