@@ -76,6 +76,12 @@ import { handleWebhook } from "./routes/webhook";
 import { asyncGeneratorToStream } from "./stream";
 import { parseColbyCommand } from "./modules/colby";
 import { setupCommandStatusSocket } from "./modules/command_status_ws";
+import {
+    CopilotToolInvocation,
+    createCopilotMcpSseResponse,
+    handleCopilotResourceRequest,
+    handleCopilotToolInvocation,
+} from "./modules/github_copilot_mcp";
 
 /**
  * Runtime bindings available to this Worker.
@@ -283,6 +289,49 @@ app.get("/demo/stream", (_c: HonoContext) => {
     return new Response(asyncGeneratorToStream(run()), {
         headers: { "Content-Type": "text/event-stream" },
     });
+});
+
+/**
+ * GET /mcp/github-copilot/sse
+ * Model Context Protocol SSE endpoint used by GitHub Copilot tools.
+ */
+app.get("/mcp/github-copilot/sse", async (c: HonoContext) => {
+    return await createCopilotMcpSseResponse(c.env.DB);
+});
+
+/**
+ * GET /mcp/github-copilot/resource?uri=...
+ * Retrieves MCP resource payloads (configs, instructions, tasks, questions).
+ */
+app.get("/mcp/github-copilot/resource", async (c: HonoContext) => {
+    const uri = c.req.query("uri");
+    if (!uri) {
+        return c.json({ error: "uri query parameter required" }, 400);
+    }
+    try {
+        const payload = await handleCopilotResourceRequest(c.env.DB, uri);
+        return c.json(payload);
+    } catch (error) {
+        console.error("[MCP] Failed to fetch resource", { uri, error });
+        const message = error instanceof Error ? error.message : "Unknown error";
+        return c.json({ error: message }, 500);
+    }
+});
+
+/**
+ * POST /mcp/github-copilot/tool
+ * Invokes MCP tool handlers for GitHub Copilot.
+ */
+app.post("/mcp/github-copilot/tool", async (c: HonoContext) => {
+    try {
+        const body = (await c.req.json()) as CopilotToolInvocation;
+        const result = await handleCopilotToolInvocation(c.env.DB, body);
+        return c.json(result);
+    } catch (error) {
+        console.error("[MCP] Tool invocation failed", error);
+        const message = error instanceof Error ? error.message : "Unknown error";
+        return c.json({ error: message }, 500);
+    }
 });
 
 /**

@@ -77,6 +77,19 @@ export const DEFAULT_MCP_TOOLS: McpToolsConfig = {
         "search_cloudflare_documentation",
         "migrate_pages_to_workers_guide"
       ]
+    },
+    "github-copilot-mcp": {
+      type: "sse",
+      url: "{{worker_base_url}}/mcp/github-copilot/sse",
+      tools: [
+        "get_copilot_config",
+        "list_instructions",
+        "submit_question",
+        "list_questions",
+        "list_tasks",
+        "create_manual_task",
+        "update_task_status"
+      ]
     }
   }
 }
