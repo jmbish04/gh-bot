@@ -89,8 +89,8 @@ Respond with JSON only.`,
         if (!result || typeof result !== "object") {
           throw new Error("Agent result missing");
         }
-        const text = typeof result.response === "string" ? result.response : JSON.stringify(result);
-        const json = JSON.parse(text) as RepoSummary;
+        const rawText = typeof result.response === 'string' ? result.response : JSON.stringify(result.response);
+        const json = JSON.parse(rawText.replace(/```json\n?|```/g, '').trim()) as RepoSummary;
         return json;
       } catch (error) {
         logger.error("Agent summarization failed", { error: error instanceof Error ? error.message : String(error) });
