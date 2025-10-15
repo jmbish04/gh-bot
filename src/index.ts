@@ -82,6 +82,19 @@ import {
     handleCopilotResourceRequest,
     handleCopilotToolInvocation,
 } from "./modules/github_copilot_mcp";
+import {
+    createLogger,
+    debounceRepo,
+    formatTimestamp,
+    hasNoBotAgentsLabel,
+    normalizeRepositoryTarget,
+    type Logger,
+    type RepositoryTarget,
+} from "./util";
+import { GitHubClient, ensureBranchExists, ensurePullRequestWithCommit, type CommitFile } from "./github";
+import { introspectRepository } from "./introspect";
+import { renderAgentBundle } from "./policy";
+import { mergeGeminiConfig, renderGeminiConfig, renderStyleguide } from "./gemini";
 
 /**
  * Runtime bindings available to this Worker.
@@ -96,6 +109,9 @@ type Env = {
     GITHUB_APP_ID: string;
     GITHUB_PRIVATE_KEY: string;
     GITHUB_WEBHOOK_SECRET: string;
+    GITHUB_TOKEN?: string;
+    GITHUB_INSTALLATION_ID?: string;
+    GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string;
     CF_ACCOUNT_ID: string;
     CF_API_TOKEN: string;
     SUMMARY_CF_MODEL: string;
@@ -107,6 +123,7 @@ type Env = {
     AI: any; // Workers AI binding
     VECTORIZE_INDEX: VectorizeIndex;
     USER_PREFERENCES: KVNamespace; // User preferences KV storage
+    AGENT_DEBOUNCE?: KVNamespace;
 };
 
 type HonoContext = Context<{ Bindings: Env }>;
@@ -115,10 +132,136 @@ const app = new Hono<{ Bindings: Env }>();
 
 // Global CORS headers for API responses
 const CORS_HEADERS = {
-	"Access-Control-Allow-Origin": "*",
-	"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-	"Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
+
+const PR_FILE_ORDER = [
+    "agent.md",
+    "gemini.md",
+    "cursor-agent.md",
+    "copilot.md",
+    ".gemini/config.yaml",
+    ".gemini/styleguide.md",
+];
+
+function buildPrBody(actions: Map<string, string>): string {
+    const header = "| File | Action |\n| --- | --- |";
+    const rows = PR_FILE_ORDER.map((file) => `| ${file} | ${actions.get(file) ?? "unchanged"} |`).join("\n");
+    return `${header}\n${rows}\n\n- Non-destructive merges preserved existing customizations.\n- Agent files synchronized and repo-aware.\n`;
+}
+
+async function handleRepoStandardization(
+    env: Env,
+    target: RepositoryTarget,
+    logger: Logger,
+    skipByLabel: boolean
+): Promise<void> {
+    try {
+        if (skipByLabel) {
+            logger.info("Skipping agent standardization due to no-bot-agents label");
+            return;
+        }
+
+        const proceed = await debounceRepo(env.AGENT_DEBOUNCE, target, 30, logger);
+        if (!proceed) {
+            return;
+        }
+
+        const client = new GitHubClient({ env, logger });
+        const fallbackBranch = env.GITHUB_REPO_DEFAULT_BRANCH_FALLBACK ?? "main";
+        const defaultBranch = await client.getDefaultBranch(target, fallbackBranch);
+        const existingPr = await client.findOpenStandardizationPr(target);
+        const comparisonRef = existingPr?.head.ref ?? defaultBranch;
+
+        const summary = await introspectRepository(env, target, defaultBranch, { githubClient: client, logger });
+        if (summary.hasOptOutFile || summary.optOut) {
+            logger.info("Skipping agent standardization due to opt-out signal", {
+                hasOptOutFile: summary.hasOptOutFile,
+                optOut: summary.optOut,
+            });
+            return;
+        }
+
+        const actions = new Map<string, string>();
+        for (const file of PR_FILE_ORDER) {
+            actions.set(file, "unchanged");
+        }
+
+        const bundle = renderAgentBundle(summary);
+        const commitFiles: CommitFile[] = [];
+
+        for (const [path, content] of bundle) {
+            const baseName = path.split("/").pop() ?? path;
+            const existingFile = await client.getFile(target, path, comparisonRef);
+            if (!existingFile) {
+                commitFiles.push({ path, content });
+                actions.set(baseName, "add");
+            } else if (existingFile.content !== content) {
+                commitFiles.push({ path, content });
+                actions.set(baseName, "update");
+            }
+        }
+
+        const generatedConfig = renderGeminiConfig(summary);
+        const existingConfig = await client.getFile(target, ".gemini/config.yaml", comparisonRef);
+        const mergedConfig = mergeGeminiConfig(existingConfig?.content, generatedConfig);
+        if (!existingConfig) {
+            commitFiles.push({ path: ".gemini/config.yaml", content: mergedConfig });
+            actions.set(".gemini/config.yaml", "add");
+        } else if (existingConfig.content !== mergedConfig) {
+            commitFiles.push({ path: ".gemini/config.yaml", content: mergedConfig });
+            actions.set(".gemini/config.yaml", "update (merge)");
+        }
+
+        const existingStyleguide = await client.getFile(target, ".gemini/styleguide.md", comparisonRef);
+        const renderedStyleguide = renderStyleguide(summary, existingStyleguide?.content ?? null);
+        if (!existingStyleguide) {
+            commitFiles.push({ path: ".gemini/styleguide.md", content: renderedStyleguide });
+            actions.set(".gemini/styleguide.md", "add");
+        } else if (existingStyleguide.content !== renderedStyleguide) {
+            commitFiles.push({ path: ".gemini/styleguide.md", content: renderedStyleguide });
+            actions.set(".gemini/styleguide.md", "update");
+        }
+
+        if (commitFiles.length === 0) {
+            logger.info("Repository already compliant with agent and Gemini policies");
+            return;
+        }
+
+        let branchName = existingPr?.head.ref;
+        if (!branchName) {
+            const baseSha = await client.getBranchSha(target, defaultBranch);
+            branchName = `auto/standardize-agents-${baseSha.slice(0, 7)}-${formatTimestamp()}`;
+            await ensureBranchExists(client, target, branchName, defaultBranch, logger);
+        }
+
+        const prBody = buildPrBody(actions);
+
+        await ensurePullRequestWithCommit({
+            client,
+            target,
+            baseBranch: defaultBranch,
+            branch: branchName,
+            commitMessage: "chore(agents): sync agent instruction files",
+            files: commitFiles,
+            logger,
+            prBody,
+            existingPr,
+        });
+
+        logger.info("Standardization PR ensured", {
+            branch: branchName,
+            files: commitFiles.length,
+            comparisonRef,
+        });
+    } catch (error) {
+        logger.error("Failed to standardize agent assets", {
+            error: error instanceof Error ? error.message : String(error),
+        });
+    }
+}
 
 // Apply CORS headers to all responses, but preserve existing content-type
 app.use("*", async (c, next) => {
@@ -816,6 +959,29 @@ app.post("/github/webhook", async (c: HonoContext) => {
         console.log("[MAIN] Calling handleWebhook...");
         const response = await handleWebhook(webhookData, c.env);
         console.log("[MAIN] handleWebhook completed, status:", response.status);
+
+        if (response.status < 400) {
+            try {
+                const payload = JSON.parse(bodyText);
+                const target = normalizeRepositoryTarget(payload);
+                if (target) {
+                    const logger = createLogger("agent-standardizer", {
+                        owner: target.owner,
+                        repo: target.repo,
+                        delivery,
+                        event,
+                    });
+                    const skipByLabel = hasNoBotAgentsLabel(payload);
+                    c.executionCtx?.waitUntil(handleRepoStandardization(c.env, target, logger, skipByLabel));
+                } else {
+                    console.debug("[MAIN] No repository data detected for standardizer");
+                }
+            } catch (error) {
+                console.warn("[MAIN] Failed to enqueue agent standardization", {
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
+        }
 
         return response;
     } catch (error) {
