@@ -27,6 +27,10 @@ type Env = {
   PR_WORKFLOWS: DurableObjectNamespace
   RESEARCH_ORCH?: DurableObjectNamespace
   AI?: any
+  GITHUB_TOKEN?: string
+  GITHUB_INSTALLATION_ID?: string
+  GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string
+  AGENT_DEBOUNCE?: KVNamespace
 }
 
 type WebhookData = {

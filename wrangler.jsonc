@@ -56,8 +56,9 @@
 			"preview_id": "7fc6108f01184967aeaf2109da0549de"
 		}
 	],
-	"vars": {
-		"REQUIRED_LABEL": "auto-commit-ok",
-		"SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b"
-	}
+        "vars": {
+                "REQUIRED_LABEL": "auto-commit-ok",
+                "SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b",
+                "GITHUB_REPO_DEFAULT_BRANCH_FALLBACK": "main"
+        }
 }
