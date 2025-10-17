@@ -831,7 +831,7 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
   // Check if repository contains wrangler files (indicating it's a Cloudflare project)
   const [owner, repoName] = repo.split('/')
 
-  const authToken = env.GITHUB_TOKEN ?? env.GITHUB_WEBHOOK_SECRET
+  const authToken = env.GITHUB_TOKEN
   if (!authToken) {
     console.warn('[WEBHOOK] Missing GitHub token to inspect repository contents for wrangler files')
     return new Response('repository-created-missing-token', { status: 202 })
