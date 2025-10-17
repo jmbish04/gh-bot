@@ -54,6 +54,7 @@ import { type Context, Hono } from "hono";
 import { PrWorkflow } from "./do_pr_workflows";
 import { ProfileScanner } from "./do_profile_scanner";
 import { ResearchOrchestrator } from "./do_research";
+import { RepositorySetupCoordinator } from "./do_repo_setup";
 // Import new Colby service modules
 import { generateAgentAssets } from "./modules/agent_generator";
 import { summarizeRepo } from "./modules/ai";
@@ -126,12 +127,15 @@ type Env = {
     RESEARCH_ORCH?: DurableObjectNamespace;
     PR_WORKFLOWS: DurableObjectNamespace;
     PROFILE_SCANNER: DurableObjectNamespace; // Matches wrangler.toml binding name
+    REPO_SETUP: DurableObjectNamespace;
     ASSETS: Fetcher; // Static assets binding
     AI: any; // Workers AI binding
     VECTORIZE_INDEX: VectorizeIndex;
     USER_PREFERENCES: KVNamespace; // User preferences KV storage
     AGENT_DEBOUNCE?: KVNamespace;
-	SEB: SendEmail; // Send Email Binding
+    REPO_MEMORY: KVNamespace;
+    CF_BINDINGS_MCP_URL?: string;
+    SEB: SendEmail; // Send Email Binding
 };
 
 type HonoContext = Context<{ Bindings: Env }>;
@@ -1034,7 +1038,7 @@ export default {
 };
 
 // Export Durable Object classes so Wrangler can register them
-export { ProfileScanner, PrWorkflow, ResearchOrchestrator };
+export { ProfileScanner, PrWorkflow, ResearchOrchestrator, RepositorySetupCoordinator };
 
 /**
  * Synchronizes repositories by fetching and updating their metadata.
