@@ -148,7 +148,7 @@ export class GitHubClient {
     if (!params.has('per_page') && this.options.defaultPerPage) {
       params.set('per_page', String(this.options.defaultPerPage));
     }
-    if ([...params.keys()].length > 0) {
+    if (params.toString()) {
       nextUrl.search = params.toString();
     }
 
