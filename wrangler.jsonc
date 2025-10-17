@@ -58,7 +58,8 @@
 	],
         "send_email": [
                 {
-                        "name": "SEB"
+                        "name": "SEB",
+ 						"destination_address": "justin@126colby.com"
                 }
         ],
         "vars": {
