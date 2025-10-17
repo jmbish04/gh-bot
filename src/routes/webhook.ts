@@ -26,12 +26,15 @@ type Env = {
   DB: D1Database
   GITHUB_WEBHOOK_SECRET: string
   PR_WORKFLOWS: DurableObjectNamespace
+  REPO_SETUP: DurableObjectNamespace
   RESEARCH_ORCH?: DurableObjectNamespace
   AI?: any
   GITHUB_TOKEN?: string
   GITHUB_INSTALLATION_ID?: string
   GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string
   AGENT_DEBOUNCE?: KVNamespace
+  REPO_MEMORY?: KVNamespace
+  CF_BINDINGS_MCP_URL?: string
 }
 
 type WebhookData = {
@@ -90,6 +93,27 @@ async function isNewRepository(env: Env, repo: string): Promise<boolean> {
 /**
  * Triggers a research sweep for a specific repository
  */
+
+async function triggerRepositorySetup(env: Env, repo: string, owner: string, defaultBranch: string | undefined, installationId: number | undefined, eventType: string) {
+  if (!env.REPO_SETUP) {
+    console.log('[WEBHOOK] Repository setup durable object not configured, skipping bootstrap');
+    return;
+  }
+
+  try {
+    const doId = env.REPO_SETUP.idFromName(repo);
+    const stub = env.REPO_SETUP.get(doId);
+    const body = { owner, repo: repo.split('/')[1], eventType, installationId, defaultBranch };
+    await stub.fetch('https://repo-setup/analyze', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    console.log('[WEBHOOK] Repository setup workflow triggered', { repo, eventType });
+  } catch (error) {
+    console.error('[WEBHOOK] Failed to trigger repository setup workflow', { repo, error });
+  }
+}
 async function triggerResearchSweep(env: Env, repo: string): Promise<void> {
   if (!env.RESEARCH_ORCH) {
     console.log('[WEBHOOK] Research orchestrator not available, skipping research sweep')
@@ -815,6 +839,11 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
 
   // Check and setup MCP tools for the repository
   await handleMcpToolsForRepo(env.DB, repo, 'repository_created')
+
+  // Trigger automated repository setup tasks
+  triggerRepositorySetup(env, repo, p.repository.owner.login, p.repository.default_branch, p.installation?.id, 'repository_created').catch((error) => {
+    console.error('[WEBHOOK] Repository setup trigger failed', error)
+  })
 
   // Check if this is a new repository and trigger research sweep
   const isNew = await isNewRepository(env, repo)
