@@ -1,7 +1,7 @@
 import type { H3Event } from 'h3';
 import OpenAI from 'openai';
 import { saveFailedQuery, saveUserQuery } from './modules/db';
-import { searchGithub } from './modules/github';
+import { searchGithub } from './github';
 import type { UserQuery } from './types/db';
 
 // Constants

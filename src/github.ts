@@ -1,4 +1,4 @@
-// TODO(ch2): integrate methods and app refactors in next chunk
+import jwt from '@tsndr/cloudflare-worker-jwt';
 import type { Logger, RepositoryTarget } from './util';
 /**
  * A thin, centralized GitHub API client used across the worker runtime.
@@ -10,12 +10,34 @@ import type { Logger, RepositoryTarget } from './util';
  * token can be used instead. All outgoing requests include the appropriate
  * Authorization header and default to GitHub's canonical REST base URL unless a
  * custom Enterprise Server origin is supplied.
+ *
+ * ## How to use
+ *
+ * ```ts
+ * import { createInstallationClient } from './github';
+ *
+ * const client = await createInstallationClient(env, installationId, { logger });
+ * const comments = await client.listPullRequestReviewComments({
+ *   owner: 'octocat',
+ *   repo: 'hello-world',
+ *   pull_number: 42,
+ * });
+ *
+ * await client.replyToComment({
+ *   owner: 'octocat',
+ *   repo: 'hello-world',
+ *   pull_number: 42,
+ *   comment_id: comments[0]?.id ?? 0,
+ *   body: 'Thanks for the review!'
+ * });
+ * ```
  */
 
 export interface GitHubEnv {
   GITHUB_TOKEN?: string;
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
+  GITHUB_PRIVATE_KEY?: string;
   GITHUB_INSTALLATION_ID?: string;
   GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string;
 }
@@ -31,6 +53,8 @@ export interface GitHubClientOptions {
   timeoutMs?: number;
   requestTag?: string;
 }
+
+export type GitHubAppRequestOptions = Pick<GitHubClientOptions, 'baseUrl' | 'requestTag' | 'logger'>;
 
 interface InternalGitHubClientOptions extends GitHubClientOptions {
   baseUrl: string;
@@ -91,6 +115,40 @@ export interface CommitFile {
   mode?: '100644' | '100755' | '040000' | '160000' | '120000';
 }
 
+export interface GitHubSearchParams {
+  per_page?: number;
+  page?: number;
+  sort?: string;
+  order?: 'asc' | 'desc';
+}
+
+export interface ReplyToCommentParams {
+  owner: string;
+  repo: string;
+  pull_number: number;
+  comment_id: number;
+  body: string;
+}
+
+export interface ReactionParams {
+  owner: string;
+  repo: string;
+  comment_id: number;
+  content: string;
+}
+
+export interface ReplyToGitHubCommentArgs extends ReplyToCommentParams {
+  installationToken?: string;
+  client?: GitHubClient;
+  options?: GitHubClientOptions;
+}
+
+export interface ReactionRequestArgs extends ReactionParams {
+  installationToken?: string;
+  client?: GitHubClient;
+  options?: GitHubClientOptions;
+}
+
 /**
  * Error thrown when GitHub's GraphQL API returns an `errors` payload.
  */
@@ -143,6 +201,77 @@ export class GitHubClient {
   public async request<T>(path: string, init?: RequestInit): Promise<T> {
     const { data } = await this.fetchJson<T>(this.buildUrl(path), init);
     return data;
+  }
+
+  /**
+   * Executes a REST request with an explicit HTTP method and optional JSON body.
+   *
+   * @param method - The HTTP method to use (e.g. `GET`, `POST`).
+   * @param path - The API path or absolute URL to request.
+   * @param body - Optional JSON-serialisable payload included in the request body.
+   * @param init - Additional fetch options, such as custom headers.
+   * @returns A promise resolving with the parsed JSON response body.
+   * @throws {GitHubHttpError} If GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * await client.rest('POST', `/repos/${owner}/${repo}/issues`, { title: 'Hello', body: 'World' });
+   * ```
+   */
+  public async rest<T>(method: string, path: string, body?: unknown, init?: RequestInit): Promise<T> {
+    const url = this.buildUrl(path);
+    const headers = new Headers(init?.headers);
+    let requestBody = init?.body;
+
+    if (body !== undefined) {
+      headers.set('content-type', 'application/json');
+      requestBody = JSON.stringify(body);
+    }
+
+    const { data } = await this.fetchJson<T>(url, {
+      ...init,
+      method,
+      headers,
+      body: requestBody,
+    });
+    return data;
+  }
+
+  /**
+   * Executes a REST request and returns both the parsed JSON body and the raw response metadata.
+   *
+   * @param method - The HTTP method to invoke.
+   * @param path - The REST API path to call.
+   * @param body - Optional JSON payload to include in the request body.
+   * @param init - Additional fetch options, such as custom headers.
+   * @returns A promise resolving with the parsed JSON body and originating response object.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const { data, response } = await client.restWithResponse('GET', `/rate_limit`);
+   * console.log(response.headers.get('x-ratelimit-remaining'));
+   * ```
+   */
+  public async restWithResponse<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    init?: RequestInit
+  ): Promise<{ data: T; response: Response }> {
+    const url = this.buildUrl(path);
+    const headers = new Headers(init?.headers);
+    let requestBody = init?.body;
+
+    if (body !== undefined) {
+      headers.set('content-type', 'application/json');
+      requestBody = JSON.stringify(body);
+    }
+
+    return this.fetchJson<T>(url, {
+      ...init,
+      method,
+      headers,
+      body: requestBody,
+    });
   }
 
   /**
@@ -222,6 +351,7 @@ export class GitHubClient {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
+        authorization: `Bearer ${this.options.token}`,
       },
       body: JSON.stringify({ query, variables }),
     };
@@ -382,6 +512,31 @@ export class GitHubClient {
       }
       throw error;
     }
+  }
+
+  /**
+   * Reads a file at a specific ref and returns the decoded UTF-8 contents when present.
+   *
+   * @param params - The repository target, file path, and ref to read.
+   * @returns The decoded file contents or null when the file is absent.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code other than 404.
+   * @example
+   * ```ts
+   * const text = await client.getFileAtRef({ target: { owner: 'octocat', repo: 'hello-world' }, path: 'README.md', ref: 'main' });
+   * console.log(text?.slice(0, 40));
+   * ```
+   */
+  public async getFileAtRef({
+    target,
+    path,
+    ref,
+  }: {
+    target: RepositoryTarget;
+    path: string;
+    ref: string;
+  }): Promise<string | null> {
+    const file = await this.getFile(target, path, ref);
+    return file?.content ?? null;
   }
 
   /**
@@ -580,6 +735,95 @@ export class GitHubClient {
   }
 
   /**
+   * Replies to a review or issue comment, automatically routing to the correct endpoint and falling back to GraphQL when necessary.
+   *
+   * @param params - The owner, repository, pull request number, target comment ID, and markdown body.
+   * @returns A promise resolving with the created comment payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * await client.replyToComment({ owner: 'octocat', repo: 'hello-world', pull_number: 42, comment_id: 123, body: 'Thanks!' });
+   * ```
+   */
+  public async replyToComment<T = unknown>({
+    owner,
+    repo,
+    pull_number,
+    comment_id,
+    body,
+  }: ReplyToCommentParams): Promise<T> {
+    const base = `/repos/${owner}/${repo}`;
+    let reviewComment: { node_id?: string } | null = null;
+
+    try {
+      reviewComment = await this.rest<{ node_id?: string }>('GET', `${base}/pulls/comments/${comment_id}`);
+    } catch (error) {
+      if (!(error instanceof GitHubHttpError && error.status === 404)) {
+        throw error;
+      }
+    }
+
+    if (reviewComment) {
+      try {
+        return await this.rest<T>('POST', `${base}/pulls/comments/${comment_id}/replies`, { body });
+      } catch (error) {
+        if (!(error instanceof GitHubHttpError)) {
+          throw error;
+        }
+        if (!reviewComment.node_id) {
+          throw error;
+        }
+        const result = await this.graphql<{ addPullRequestReviewComment?: { comment?: T } }>(
+          `mutation Reply($input: AddPullRequestReviewCommentInput!) {
+            addPullRequestReviewComment(input: $input) {
+              comment { id body }
+            }
+          }`,
+          { input: { inReplyTo: reviewComment.node_id, body } }
+        );
+        const comment = result.addPullRequestReviewComment?.comment;
+        if (comment) {
+          return comment;
+        }
+        throw error;
+      }
+    }
+
+    try {
+      await this.rest('GET', `${base}/issues/comments/${comment_id}`);
+    } catch (error) {
+      if (error instanceof GitHubHttpError && error.status === 404) {
+        throw new Error(
+          `Comment ${comment_id} not found as a pull request review or issue comment. Verify repository and permissions.`
+        );
+      }
+      throw error;
+    }
+
+    return this.rest<T>('POST', `${base}/issues/${pull_number}/comments`, { body });
+  }
+
+  /**
+   * Adds a reaction to an issue or pull request comment.
+   *
+   * @param params - The owner, repository, comment identifier, and reaction content (e.g. `+1`).
+   * @returns A promise resolving with the created reaction payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * await client.addReactionToComment({ owner: 'octocat', repo: 'hello-world', comment_id: 123, content: '+1' });
+   * ```
+   */
+  public addReactionToComment<T = unknown>({ owner, repo, comment_id, content }: ReactionParams): Promise<T> {
+    return this.rest<T>(
+      'POST',
+      `/repos/${owner}/${repo}/issues/comments/${comment_id}/reactions`,
+      { content },
+      { headers: { accept: 'application/vnd.github+json' } }
+    );
+  }
+
+  /**
    * Lists issues (and pull requests) for a repository, supporting optional state filtering for dashboards.
    *
    * @param params - The owner, repository, and optional issue state filter.
@@ -690,6 +934,97 @@ export class GitHubClient {
     issue_number: number;
   }): Promise<T[]> {
     return this.requestPaginated<T>(`/repos/${owner}/${repo}/issues/${issue_number}/comments`);
+  }
+
+  /**
+   * Performs a GitHub search request across a REST search endpoint.
+   *
+   * @param endpoint - The search resource to query (e.g. `repositories`, `code`).
+   * @param query - The GitHub search query string.
+   * @param params - Optional pagination and sorting parameters.
+   * @returns A promise resolving with the raw search response payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const repos = await client.search('repositories', 'topic:workers language:typescript', { per_page: 5 });
+   * console.log(repos.items?.length ?? 0);
+   * ```
+   */
+  public search<T = unknown>(
+    endpoint: 'code' | 'commits' | 'issues' | 'repositories' | 'users',
+    query: string,
+    params: GitHubSearchParams = {}
+  ): Promise<T> {
+    const searchParams = buildSearchParams(query, params);
+    return this.request<T>(`/search/${endpoint}?${searchParams.toString()}`);
+  }
+
+  /**
+   * Searches GitHub repositories using the REST search API.
+   *
+   * @param query - The GitHub search query string.
+   * @param params - Optional pagination and sorting parameters.
+   * @returns A promise resolving with the repository search response payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const results = await client.searchRepositories('topic:workers', { per_page: 10 });
+   * console.log(results.items.length);
+   * ```
+   */
+  public searchRepositories<T = unknown>(query: string, params: GitHubSearchParams = {}): Promise<T> {
+    return this.search<T>('repositories', query, params);
+  }
+
+  /**
+   * Searches GitHub code results using the REST search API.
+   *
+   * @param query - The GitHub code search query string.
+   * @param params - Optional pagination and sorting parameters.
+   * @returns A promise resolving with the code search response payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const code = await client.searchCode('repo:octocat/hello-world path:/ README', { per_page: 5 });
+   * console.log(code.items.length);
+   * ```
+   */
+  public searchCode<T = unknown>(query: string, params: GitHubSearchParams = {}): Promise<T> {
+    return this.search<T>('code', query, params);
+  }
+
+  /**
+   * Searches GitHub issues and pull requests using the REST search API.
+   *
+   * @param query - The GitHub issues search query string.
+   * @param params - Optional pagination and sorting parameters.
+   * @returns A promise resolving with the issues search response payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const issues = await client.searchIssues('repo:octocat/hello-world is:issue', { per_page: 3 });
+   * console.log(issues.total_count);
+   * ```
+   */
+  public searchIssues<T = unknown>(query: string, params: GitHubSearchParams = {}): Promise<T> {
+    return this.search<T>('issues', query, params);
+  }
+
+  /**
+   * Searches GitHub users using the REST search API.
+   *
+   * @param query - The GitHub users search query string.
+   * @param params - Optional pagination and sorting parameters.
+   * @returns A promise resolving with the users search response payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const users = await client.searchUsers('type:user location:berlin');
+   * console.log(users.items.map((user: any) => user.login));
+   * ```
+   */
+  public searchUsers<T = unknown>(query: string, params: GitHubSearchParams = {}): Promise<T> {
+    return this.search<T>('users', query, params);
   }
 
   /**
@@ -1013,6 +1348,408 @@ export class GitHubClient {
     }
     return headers;
   }
+}
+
+/**
+ * Creates a signed JSON Web Token that authenticates as the configured GitHub App.
+ *
+ * @param env - The environment containing GitHub App credentials.
+ * @returns A promise resolving with the signed JWT string.
+ * @throws {Error} When required GitHub App credentials are missing.
+ * @example
+ * ```ts
+ * const jwtToken = await createGitHubAppJwt(env);
+ * ```
+ */
+export async function createGitHubAppJwt(env: GitHubEnv): Promise<string> {
+  const appId = env.GITHUB_APP_ID;
+  const privateKey = env.GITHUB_APP_PRIVATE_KEY ?? env.GITHUB_PRIVATE_KEY;
+  if (!appId || !privateKey) {
+    throw new Error('GitHub App credentials are required to mint an app JWT.');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    { iat: now - 60, exp: now + 9 * 60, iss: appId },
+    privateKey,
+    { algorithm: 'RS256' }
+  );
+}
+
+/**
+ * Lists installations for the configured GitHub App.
+ *
+ * @param env - The environment containing GitHub App credentials.
+ * @param options - Optional request overrides such as base URL or request tag.
+ * @returns A promise resolving with the installations payload from GitHub.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * const installations = await listInstallations(env);
+ * console.log(installations.length);
+ * ```
+ */
+export async function listInstallations<T = unknown>(
+  env: GitHubEnv,
+  options: GitHubAppRequestOptions = {}
+): Promise<T> {
+  const appJwt = await createGitHubAppJwt(env);
+  const url = new URL('/app/installations', `${resolveBaseUrl(options.baseUrl)}/`);
+  const response = await fetch(url, {
+    headers: buildAppHeaders(appJwt, options),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    const parsed = text ? safeParseJSON(text) : undefined;
+    throw new GitHubHttpError(
+      `GitHub request failed with status ${response.status}`,
+      response.status,
+      response.url,
+      parsed,
+      response.headers
+    );
+  }
+
+  const text = await response.text();
+  return text ? (safeParseJSON<T>(text) as T) : (([] as unknown) as T);
+}
+
+/**
+ * Retrieves an installation token for a specific GitHub App installation.
+ *
+ * @param env - The environment containing GitHub App credentials.
+ * @param installationId - The GitHub App installation identifier.
+ * @param options - Optional request overrides such as base URL or request tag.
+ * @returns A promise resolving with the installation access token.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @throws {Error} When the response body does not include an access token.
+ * @example
+ * ```ts
+ * const token = await getInstallationToken(env, installationId);
+ * ```
+ */
+export async function getInstallationToken(
+  env: GitHubEnv,
+  installationId: number,
+  options: GitHubAppRequestOptions = {}
+): Promise<string> {
+  const appJwt = await createGitHubAppJwt(env);
+  const url = new URL(
+    `/app/installations/${installationId}/access_tokens`,
+    `${resolveBaseUrl(options.baseUrl)}/`
+  );
+
+  const headers = buildAppHeaders(appJwt, options);
+  headers.set('content-type', 'application/json');
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({}),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    const parsed = text ? safeParseJSON(text) : undefined;
+    throw new GitHubHttpError(
+      `GitHub request failed with status ${response.status}`,
+      response.status,
+      response.url,
+      parsed,
+      response.headers
+    );
+  }
+
+  const text = await response.text();
+  const data = text ? safeParseJSON<{ token?: string }>(text) : {};
+  if (typeof data === 'object' && data && typeof data.token === 'string') {
+    return data.token;
+  }
+  throw new Error('GitHub installation token response did not include a token.');
+}
+
+/**
+ * Convenience helper that mints an installation token and returns an authenticated GitHub client.
+ *
+ * @param env - The environment containing GitHub App credentials.
+ * @param installationId - The GitHub App installation identifier.
+ * @param options - Additional client configuration overrides.
+ * @returns A promise resolving with a GitHub client authenticated as the installation.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code while minting the token.
+ * @example
+ * ```ts
+ * const client = await createInstallationClient(env, installationId, { logger });
+ * ```
+ */
+export async function createInstallationClient(
+  env: GitHubEnv,
+  installationId: number,
+  options: Omit<GitHubClientOptions, 'installationToken' | 'personalAccessToken'> = {}
+): Promise<GitHubClient> {
+  const token = await getInstallationToken(env, installationId, options);
+  options.logger?.debug('Created installation client', { installationId });
+  return new GitHubClient({ ...options, env, installationToken: token });
+}
+
+/**
+ * Executes a GitHub REST request using either an existing client or a token string.
+ *
+ * @param input - A GitHub client instance or installation token string.
+ * @param method - The HTTP method to invoke.
+ * @param path - The REST API path to call.
+ * @param body - Optional JSON payload to include in the request body.
+ * @param options - Optional client configuration when providing a token.
+ * @returns The parsed JSON response body from GitHub.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * const data = await ghREST(token, 'GET', `/repos/${owner}/${repo}`);
+ * ```
+ */
+export function ghREST(
+  input: GitHubClient | string,
+  method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE',
+  path: string,
+  body?: unknown,
+  options?: GitHubClientOptions
+): Promise<unknown> {
+  const client = ensureClient(input, options);
+  return client.rest(method, path, body);
+}
+
+/**
+ * Executes a GitHub GraphQL request and returns the raw data/errors payload.
+ *
+ * @param input - A GitHub client instance or installation token string.
+ * @param query - The GraphQL document string to execute.
+ * @param variables - Optional GraphQL variables.
+ * @param options - Optional client configuration when providing a token.
+ * @returns An object containing the `data` property and optional `errors` array.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * const result = await ghGraphQL(token, 'query { viewer { login } }');
+ * console.log(result.data?.viewer?.login);
+ * ```
+ */
+export async function ghGraphQL<T = unknown>(
+  input: GitHubClient | string,
+  query: string,
+  variables?: Record<string, unknown>,
+  options?: GitHubClientOptions
+): Promise<{ data?: T; errors?: GraphQLErrorPayload[] }> {
+  const client = ensureClient(input, options);
+  try {
+    const data = await client.graphql<T>(query, variables);
+    return { data };
+  } catch (error) {
+    if (error instanceof GitHubGraphQLError) {
+      return { errors: error.errors };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Replies to a GitHub review or issue comment using either an existing client or token.
+ *
+ * @param args - Complete reply configuration including repository coordinates and body.
+ * @returns A promise resolving with the created comment payload.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * await replyToGitHubComment({ installationToken: token, owner, repo, pull_number: 1, comment_id: 2, body: 'Thanks!' });
+ * ```
+ */
+export function replyToGitHubComment<T = unknown>(args: ReplyToGitHubCommentArgs): Promise<T> {
+  const { installationToken, client, options, ...rest } = args;
+  const resolvedClient = client ?? ensureClient(installationToken ?? '', options);
+  return resolvedClient.replyToComment(rest);
+}
+
+/**
+ * Adds a reaction to an issue or pull request comment using either an existing client or token.
+ *
+ * @param args - Reaction configuration including the comment identifier and emoji content.
+ * @returns A promise resolving with the created reaction payload.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * await addReactionToComment({ installationToken: token, owner, repo, comment_id: 123, content: '+1' });
+ * ```
+ */
+export function addReactionToComment<T = unknown>(args: ReactionRequestArgs): Promise<T> {
+  const { installationToken, client, options, ...rest } = args;
+  const resolvedClient = client ?? ensureClient(installationToken ?? '', options);
+  return resolvedClient.addReactionToComment(rest);
+}
+
+/**
+ * Reads a file at a specific ref using either an existing client or token.
+ *
+ * @param input - A GitHub client instance or installation token string.
+ * @param owner - The repository owner login.
+ * @param repo - The repository name.
+ * @param path - The file path to read.
+ * @param ref - The branch, tag, or commit ref.
+ * @param options - Optional client configuration when providing a token.
+ * @returns The decoded file contents or null when the file does not exist.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code other than 404.
+ * @example
+ * ```ts
+ * const readme = await getFileAtRef(token, 'octocat', 'hello-world', 'README.md', 'main');
+ * ```
+ */
+export function getFileAtRef(
+  input: GitHubClient | string,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+  options?: GitHubClientOptions
+): Promise<string | null> {
+  const client = ensureClient(input, options);
+  return client.getFileAtRef({ target: { owner, repo }, path, ref });
+}
+
+/**
+ * Lists repositories accessible to the provided installation token or client and returns a simplified payload.
+ *
+ * @param input - A GitHub client instance or installation token string.
+ * @param options - Optional client configuration when providing a token.
+ * @returns An array of repository descriptors including id, name, and owner login.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * const repos = await listReposForInstallation(token);
+ * ```
+ */
+export async function listReposForInstallation(
+  input: GitHubClient | string,
+  options?: GitHubClientOptions
+): Promise<
+  Array<{
+    id: number;
+    full_name: string;
+    default_branch: string;
+    visibility: string;
+    description: string | null;
+    topics: string[];
+    owner: { login: string };
+  }>
+> {
+  const client = ensureClient(input, options);
+  const response = await client.listRepositoriesForInstallation<{
+    id: number;
+    full_name: string;
+    default_branch: string;
+    visibility: string;
+    description: string | null;
+    topics?: string[];
+    owner: { login: string };
+  }>();
+  return (response.repositories ?? []).map((repo) => ({
+    id: repo.id,
+    full_name: repo.full_name,
+    default_branch: repo.default_branch,
+    visibility: repo.visibility,
+    description: repo.description ?? null,
+    topics: repo.topics ?? [],
+    owner: { login: repo.owner.login },
+  }));
+}
+
+/**
+ * Performs a GitHub search using either an existing client or token.
+ *
+ * @param input - A GitHub client instance or installation token string.
+ * @param endpoint - The GitHub search endpoint to query.
+ * @param q - The GitHub search query string.
+ * @param extra - Optional extra search parameters such as pagination.
+ * @param options - Optional client configuration when providing a token.
+ * @returns The raw search response payload from GitHub.
+ * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+ * @example
+ * ```ts
+ * const results = await searchGithub(token, 'repositories', 'topic:workers', { per_page: 5 });
+ * ```
+ */
+export function searchGithub(
+  input: GitHubClient | string,
+  endpoint: 'issues' | 'commits' | 'repositories' | 'users',
+  q: string,
+  extra: Record<string, unknown> = {},
+  options?: GitHubClientOptions
+): Promise<unknown> {
+  const client = ensureClient(input, options);
+  const params: GitHubSearchParams = {};
+  if (typeof extra.per_page === 'number') {
+    params.per_page = extra.per_page;
+  }
+  if (typeof extra.page === 'number') {
+    params.page = extra.page;
+  }
+  if (typeof extra.sort === 'string') {
+    params.sort = extra.sort;
+  }
+  if (typeof extra.order === 'string' && (extra.order === 'asc' || extra.order === 'desc')) {
+    params.order = extra.order;
+  }
+
+  if (endpoint === 'repositories') {
+    return client.searchRepositories(q, params);
+  }
+  if (endpoint === 'issues') {
+    return client.searchIssues(q, params);
+  }
+  if (endpoint === 'users') {
+    return client.searchUsers(q, params);
+  }
+  return client.search(endpoint, q, params);
+}
+
+function ensureClient(input: GitHubClient | string | undefined, options?: GitHubClientOptions): GitHubClient {
+  if (input instanceof GitHubClient) {
+    return input;
+  }
+  if (!input) {
+    throw new Error('A GitHub installation token or client must be provided.');
+  }
+  return new GitHubClient({ ...options, installationToken: input });
+}
+
+function resolveBaseUrl(baseUrl?: string): string {
+  return (baseUrl ?? 'https://api.github.com').replace(/\/$/, '');
+}
+
+function buildAppHeaders(appJwt: string, options: GitHubAppRequestOptions): Headers {
+  const headers = new Headers();
+  headers.set('accept', 'application/vnd.github+json');
+  headers.set('authorization', `Bearer ${appJwt}`);
+  headers.set('user-agent', 'gh-bot-client');
+  if (options.requestTag) {
+    headers.set('x-request-tag', options.requestTag);
+  }
+  return headers;
+}
+
+function buildSearchParams(query: string, params: GitHubSearchParams): URLSearchParams {
+  const searchParams = new URLSearchParams();
+  searchParams.set('q', query);
+  if (params.per_page != null) {
+    searchParams.set('per_page', String(params.per_page));
+  }
+  if (params.page != null) {
+    searchParams.set('page', String(params.page));
+  }
+  if (params.sort) {
+    searchParams.set('sort', params.sort);
+  }
+  if (params.order) {
+    searchParams.set('order', params.order);
+  }
+  return searchParams;
 }
 
 function encodeGitHubPath(path: string): string {

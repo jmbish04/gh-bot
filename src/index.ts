@@ -59,11 +59,6 @@ import { generateAgentAssets } from "./modules/agent_generator";
 import { summarizeRepo } from "./modules/ai";
 import { detectRepoBadges } from "./modules/badge_detector";
 import { insertRepoIfNew, markRepoSynced } from "./modules/db";
-import {
-    getInstallationToken,
-    listInstallations,
-    listReposForInstallation,
-} from "./modules/github";
 import { generateInfrastructureGuidance } from "./modules/infra_guidance";
 import { fetchRelevantLLMContent } from "./modules/llm_fetcher";
 import {
@@ -91,7 +86,18 @@ import {
     type Logger,
     type RepositoryTarget,
 } from "./util";
-import { GitHubClient, ensureBranchExists, ensurePullRequestWithCommit, type CommitFile } from "./github";
+import {
+    GitHubClient,
+    ensureBranchExists,
+    ensurePullRequestWithCommit,
+    type CommitFile,
+    getInstallationToken,
+    listInstallations,
+    listReposForInstallation,
+    ghREST,
+    getFileAtRef,
+    GitHubHttpError,
+} from "./github";
 import { introspectRepository } from "./introspect";
 import { renderAgentBundle } from "./policy";
 import { mergeGeminiConfig, renderGeminiConfig, renderStyleguide } from "./gemini";
@@ -1001,6 +1007,8 @@ app.post("/github/webhook", async (c: HonoContext) => {
  * - fetch: delegates to Hono app
  * - scheduled: triggers repo sync & discovery via cron (see wrangler.toml [triggers] crons)
  */
+export type { Env };
+
 export default {
     fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
         app.fetch(req, env, ctx),
@@ -1015,9 +1023,13 @@ export default {
      * - This path intentionally does a *lightweight* summary (summarizeRepo) to keep cost low.
      * - Deep/structured analysis is handled elsewhere (ResearchOrchestrator or manual endpoints).
      */
-    scheduled: async (_evt: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
+    scheduled: async (event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
         ctx.waitUntil(syncRepos(env));
         ctx.waitUntil(backfillLlmDocs(env));
+
+        if (event.cron === '0 12 * * *') {
+            ctx.waitUntil(runDailyDiscovery(env));
+        }
     },
 };
 
@@ -1189,16 +1201,13 @@ async function backfillLlmDocs(env: Env) {
  */
 async function checkForLlmDocs(token: string, owner: string, repo: string): Promise<boolean> {
     try {
-        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/.agents/llms`, {
-            headers: {
-                Authorization: `token ${token}`,
-                Accept: 'application/vnd.github+json',
-                'User-Agent': 'Colby-GitHub-Bot/1.0'
-            }
-        });
-        return response.ok;
-    } catch {
-        return false;
+        await ghREST(token, 'GET', `/repos/${owner}/${repo}/contents/.agents/llms`);
+        return true;
+    } catch (error) {
+        if (error instanceof GitHubHttpError && error.status === 404) {
+            return false;
+        }
+        throw error;
     }
 }
 
@@ -1212,31 +1221,22 @@ async function checkForLlmDocs(token: string, owner: string, repo: string): Prom
  */
 async function checkForWranglerFiles(token: string, owner: string, repo: string): Promise<boolean> {
     try {
-        // Check for wrangler.jsonc first
-        const wranglerJsonc = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/wrangler.jsonc`, {
-            headers: {
-                Authorization: `token ${token}`,
-                Accept: 'application/vnd.github+json',
-                'User-Agent': 'Colby-GitHub-Bot/1.0'
-            }
-        });
-
-        if (wranglerJsonc.ok) {
-            return true;
+        await ghREST(token, 'GET', `/repos/${owner}/${repo}/contents/wrangler.jsonc`);
+        return true;
+    } catch (error) {
+        if (!(error instanceof GitHubHttpError) || error.status !== 404) {
+            throw error;
         }
+    }
 
-        // Check for wrangler.toml
-        const wranglerToml = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/wrangler.toml`, {
-            headers: {
-                Authorization: `token ${token}`,
-                Accept: 'application/vnd.github+json',
-                'User-Agent': 'Colby-GitHub-Bot/1.0'
-            }
-        });
-
-        return wranglerToml.ok;
-    } catch {
-        return false;
+    try {
+        await ghREST(token, 'GET', `/repos/${owner}/${repo}/contents/wrangler.toml`);
+        return true;
+    } catch (error) {
+        if (error instanceof GitHubHttpError && error.status === 404) {
+            return false;
+        }
+        throw error;
     }
 }
 
@@ -1255,14 +1255,8 @@ async function fetchReadme(
     repo: string,
     branch: string,
 ) {
-    const res = await fetch(
-        `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`,
-        {
-            headers: { Authorization: `token ${token}` },
-        },
-    );
-    if (res.ok) return await res.text();
-    return "";
+    const content = await getFileAtRef(token, owner, repo, "README.md", branch);
+    return content ?? "";
 }
 
 /**
@@ -2489,12 +2483,7 @@ app.post("/research/analyze", async (c: HonoContext) => {
             }
         }
 
-        const repoInfo = (await fetch(
-            `https://api.github.com/repos/${owner}/${repo}`,
-            {
-                headers: { Authorization: `token ${token}` },
-            },
-        ).then((r) => r.json())) as { default_branch?: string };
+        const repoInfo = await ghREST(token, 'GET', `/repos/${owner}/${repo}`) as { default_branch?: string };
 
         if (!repoInfo.default_branch) {
             return c.json({ error: "Repository not found or no access" }, 404);
@@ -2648,12 +2637,7 @@ app.post("/research/analyze-structured", async (c: HonoContext) => {
             }
         }
 
-        const repoInfo = (await fetch(
-            `https://api.github.com/repos/${owner}/${repo}`,
-            {
-                headers: { Authorization: `token ${token}` },
-            },
-        ).then((r) => r.json())) as { default_branch?: string };
+        const repoInfo = await ghREST(token, 'GET', `/repos/${owner}/${repo}`) as { default_branch?: string };
 
         if (!repoInfo.default_branch) {
             return c.json({ error: "Repository not found or no access" }, 404);
@@ -4781,16 +4765,3 @@ app.get('/research/:taskId', async (c) => {
 });
 
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return app.fetch(request, env, ctx);
-  },
-  // Add the scheduled handler for the cron trigger
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    switch (event.cron) {
-      case '0 12 * * *': // This runs at 12:00 UTC every day
-        ctx.waitUntil(runDailyDiscovery(env));
-        break;
-    }
-  },
-};

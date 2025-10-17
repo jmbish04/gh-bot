@@ -1,6 +1,7 @@
 // src/routes/webhook.ts
 import { verify as verifySignature } from '@octokit/webhooks-methods'
 import { ensureRepoMcpTools } from '../modules/mcp_tools'
+import { ghREST, GitHubHttpError } from '../github'
 
 /**
  * Helper function to handle MCP tools setup for any repository event
@@ -830,55 +831,49 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
   // Check if repository contains wrangler files (indicating it's a Cloudflare project)
   const [owner, repoName] = repo.split('/')
 
+  const authToken = env.GITHUB_TOKEN
+  if (!authToken) {
+    console.warn('[WEBHOOK] Missing GitHub token to inspect repository contents for wrangler files')
+    return new Response('repository-created-missing-token', { status: 202 })
+  }
+
   try {
-    // Check for wrangler.jsonc first
     let hasWranglerFile = false
     try {
-      const wranglerJsonc = await fetch(`https://api.github.com/repos/${owner}/${repoName}/contents/wrangler.jsonc`, {
-        headers: {
-          'Authorization': `token ${env.GITHUB_WEBHOOK_SECRET}`,
-          'Accept': 'application/vnd.github+json',
-          'User-Agent': 'Colby-GitHub-Bot/1.0'
-        }
-      })
-      if (wranglerJsonc.ok) {
-        hasWranglerFile = true
-        console.log('[WEBHOOK] Found wrangler.jsonc in new repository')
-      }
+      await ghREST(authToken, 'GET', `/repos/${owner}/${repoName}/contents/wrangler.jsonc`)
+      hasWranglerFile = true
+      console.log('[WEBHOOK] Found wrangler.jsonc in new repository')
     } catch (error) {
-      console.log('[WEBHOOK] wrangler.jsonc not found, checking for wrangler.toml')
+      if (error instanceof GitHubHttpError && error.status === 404) {
+        console.log('[WEBHOOK] wrangler.jsonc not found, checking for wrangler.toml')
+      } else {
+        throw error
+      }
     }
 
-    // If no wrangler.jsonc, check for wrangler.toml
     if (!hasWranglerFile) {
       try {
-        const wranglerToml = await fetch(`https://api.github.com/repos/${owner}/${repoName}/contents/wrangler.toml`, {
-          headers: {
-            'Authorization': `token ${env.GITHUB_WEBHOOK_SECRET}`,
-            'Accept': 'application/vnd.github+json',
-            'User-Agent': 'Colby-GitHub-Bot/1.0'
-          }
-        })
-        if (wranglerToml.ok) {
-          hasWranglerFile = true
-          console.log('[WEBHOOK] Found wrangler.toml in new repository')
-        }
+        await ghREST(authToken, 'GET', `/repos/${owner}/${repoName}/contents/wrangler.toml`)
+        hasWranglerFile = true
+        console.log('[WEBHOOK] Found wrangler.toml in new repository')
       } catch (error) {
-        console.log('[WEBHOOK] wrangler.toml not found either')
+        if (error instanceof GitHubHttpError && error.status === 404) {
+          console.log('[WEBHOOK] wrangler.toml not found either')
+        } else {
+          throw error
+        }
       }
     }
 
     if (hasWranglerFile) {
       console.log('[WEBHOOK] Cloudflare repository detected, triggering LLMs documentation and worker optimization')
 
-      // Create a synthetic event to trigger LLMs documentation creation
       const syntheticEvent = {
         kind: 'repository_created',
         delivery,
         repo,
         author,
         installationId: p.installation?.id,
-        // Add other necessary fields for the LLMs docs creation
         prNumber: null,
         filePath: null,
         line: null,
@@ -888,19 +883,16 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
         headSha: null
       }
 
-      // Get the PR_WORKFLOWS durable object and trigger LLMs docs creation
       const doId = env.PR_WORKFLOWS.idFromName(`repo-${repo}`)
       const stub = env.PR_WORKFLOWS.get(doId)
 
-      // Trigger LLMs documentation creation
-      const llmsRes = await stub.fetch('https://do/create-llms-docs', {
+      await stub.fetch('https://do/create-llms-docs', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(syntheticEvent)
       })
 
-      // Also trigger worker optimization
-      const optimizeRes = await stub.fetch('https://do/optimize-worker', {
+      await stub.fetch('https://do/optimize-worker', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(syntheticEvent)
@@ -908,11 +900,10 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
 
       console.log('[WEBHOOK] LLMs documentation and worker optimization triggered for new Cloudflare repository')
       return new Response('repository-created-optimized', { status: 200 })
-    } else {
-      console.log('[WEBHOOK] Repository created but no wrangler files found, skipping LLMs docs creation')
-      return new Response('repository-created-no-wrangler', { status: 200 })
     }
 
+    console.log('[WEBHOOK] Repository created but no wrangler files found, skipping LLMs docs creation')
+    return new Response('repository-created-no-wrangler', { status: 200 })
   } catch (error: any) {
     console.log('[WEBHOOK] Error processing repository creation:', error)
     return new Response('repository-created-error', { status: 500 })

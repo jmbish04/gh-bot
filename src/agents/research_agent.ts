@@ -1,5 +1,5 @@
-import { Env } from '..';
-import { GitHubAPIClient } from '../github'; // Use the new, consolidated GitHub client
+import type { Env } from '..';
+import { GitHubClient } from '../github'; // Use the new, consolidated GitHub client
 import { getGeminiModel } from '../gemini'; // Assuming you have a Gemini client
 
 /**
@@ -13,7 +13,7 @@ import { getGeminiModel } from '../gemini'; // Assuming you have a Gemini client
  */
 export async function runTargetedResearch(
   db: D1Database,
-  ghClient: GitHubAPIClient,
+  ghClient: GitHubClient,
   aiModel: any, // Replace with your actual AI model type
   taskId: string,
   query: string,
@@ -94,7 +94,10 @@ export async function runTargetedResearch(
 export async function runDailyDiscovery(env: Env) {
     console.log("Starting daily discovery task...");
     const db = env.DB;
-    const ghClient = new GitHubAPIClient(env.GITHUB_TOKEN);
+    if (!env.GITHUB_TOKEN) {
+        throw new Error("GITHUB_TOKEN is required for daily discovery.");
+    }
+    const ghClient = new GitHubClient({ personalAccessToken: env.GITHUB_TOKEN });
     const aiModel = getGeminiModel(env);
 
     // 1. Fetch interests

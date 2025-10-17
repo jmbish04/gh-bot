@@ -1,5 +1,5 @@
 // src/modules/colby.ts
-import { ghREST } from './github_helpers'
+import { ghREST } from '../github'
 import { broadcastCommandStatus } from './command_status_ws'
 
 type Env = {

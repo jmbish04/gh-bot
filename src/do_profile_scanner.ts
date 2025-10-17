@@ -1,3 +1,5 @@
+import { ghREST } from './github'
+
 /**
  * Durable Object class for scanning and managing developer profiles.
  *
@@ -100,8 +102,9 @@ async function resolveOwnerToken(env: Env, login: string): Promise<{ token: stri
  * @returns The JSON response from the URL.
  */
 async function fetchJson(url: string, token: string): Promise<any> {
-  // Implementation needed
-  return {}; // Placeholder return
+  const parsed = new URL(url)
+  const path = parsed.pathname + (parsed.search || '')
+  return ghREST(token, 'GET', path)
 }
 
 /**

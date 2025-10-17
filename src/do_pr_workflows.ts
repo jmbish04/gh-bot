@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 import { summarizePRWithAI } from './modules/ai_summary'
-import { GitHubClient } from './github'
+import { GitHubClient, GitHubHttpError, getInstallationToken, ghGraphQL, ghREST, replyToGitHubComment, addReactionToComment } from './github'
 import {
   bookmarkSuggestion,
   createColbyCommand,
@@ -14,7 +14,6 @@ import {
   updateColbyCommand,
   updateOperationProgress
 } from './modules/colby'
-import { getInstallationToken, ghGraphQL, ghREST, replyToGitHubComment, addReactionToComment } from './modules/github_helpers'
 import { buildFileChangesFromSuggestions } from './modules/patcher'
 
 interface GitHubComment {
@@ -2373,26 +2372,20 @@ AI_API_TOKEN=your_ai_token_here
 
   private async getFileContent(token: string, owner: string, repo: string, path: string): Promise<string | null> {
     try {
-      const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, {
-        headers: {
-          Authorization: `token ${token}`,
-          Accept: 'application/vnd.github+json',
-          'User-Agent': 'Colby-GitHub-Bot/1.0'
-        }
-      })
-
-      if (!response.ok) {
-        return null
+      const data = await ghREST(token, 'GET', `/repos/${owner}/${repo}/contents/${path}`) as {
+        content?: string;
+        encoding?: string;
       }
-
-      const data = await response.json() as { content?: string; encoding?: string }
       if (data.content && data.encoding === 'base64') {
         return atob(data.content)
       }
 
       return null
     } catch (error) {
-      return null
+      if (error instanceof GitHubHttpError && error.status === 404) {
+        return null
+      }
+      throw error
     }
   }
 
@@ -2400,20 +2393,12 @@ AI_API_TOKEN=your_ai_token_here
     // Get current file SHA if it exists
     let sha: string | undefined
     try {
-      const existingFile = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, {
-        headers: {
-          Authorization: `token ${token}`,
-          Accept: 'application/vnd.github+json',
-          'User-Agent': 'Colby-GitHub-Bot/1.0'
-        }
-      })
-
-      if (existingFile.ok) {
-        const fileData = await existingFile.json() as { sha?: string }
-        sha = fileData.sha
-      }
+      const existingFile = await ghREST(token, 'GET', `/repos/${owner}/${repo}/contents/${path}`) as { sha?: string }
+      sha = existingFile.sha
     } catch (error) {
-      // File doesn't exist, which is fine for new files
+      if (!(error instanceof GitHubHttpError) || error.status !== 404) {
+        throw error
+      }
     }
 
     // Create/update the file
@@ -2423,21 +2408,7 @@ AI_API_TOKEN=your_ai_token_here
       ...(sha && { sha })
     }
 
-    const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, {
-      method: 'PUT',
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'Colby-GitHub-Bot/1.0',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(updateData)
-    })
-
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`Failed to update ${path}: ${response.status} ${errorText}`)
-    }
+    await ghREST(token, 'PUT', `/repos/${owner}/${repo}/contents/${path}`, updateData)
   }
 
   private async handleAutoLlmDocsCreation(evt: PREvent) {
