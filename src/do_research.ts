@@ -1,16 +1,15 @@
 /// <reference types="@cloudflare/workers-types" />
 
 import { getGeminiModel } from './gemini';
-import { GitHubAPIClient } from './github';
+import { GitHubClient, getFileAtRef, getInstallationToken, listInstallations, listReposForInstallation } from './github';
 // Existing Imports
 import { saveSummaries, summarizeRepo2 } from './modules/ai_research';
-import { getInstallationToken, listInstallations, listReposForInstallation } from './modules/github';
 import { OperationLogger } from './modules/operation_logger';
 import { enqueueOwnerScan, upsertDeveloperStub } from './modules/profiles';
 import { getExistingRepoIds } from './modules/projects';
 import { analyzeRepoCode, isRepoAnalysisStale } from './modules/repo_analyzer';
 // New Agentic Research Imports
-import { runTargetedResearch } from './modules/research_agent';
+import { runTargetedResearch } from './agents/research_agent';
 import { collectSignals, ghSearchRepos, insertFinding, scoreRepo, upsertProject } from './modules/research';
 
 // Merged Environment Type
@@ -19,6 +18,7 @@ type Env = {
   RESEARCH_ORCH: DurableObjectNamespace;
   GITHUB_APP_ID: string;
   GITHUB_PRIVATE_KEY: string;
+  GITHUB_TOKEN?: string;
   WEBHOOK_URL: string;
   GITHUB_WEBHOOK_SECRET: string;
   CF_ACCOUNT_ID: string;
@@ -172,7 +172,11 @@ export class ResearchOrchestrator {
       .bind(taskId, query, 'pending')
       .run();
 
-    const ghClient = new GitHubAPIClient(this.env.GITHUB_PRIVATE_KEY); // Simplified for example
+    const token = this.env.GITHUB_TOKEN;
+    if (!token) {
+      throw new Error('GITHUB_TOKEN is required to run targeted research.');
+    }
+    const ghClient = new GitHubClient({ personalAccessToken: token });
     const aiModel = getGeminiModel(this.env);
 
     await runTargetedResearch(this.env.DB, ghClient, aiModel, taskId, query, rounds);
@@ -313,11 +317,8 @@ export class ResearchOrchestrator {
 // --- Helper Functions ---
 
 async function fetchReadme(token: string, owner: string, repo: string, branch: string) {
-  const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/README.md`, {
-    headers: { Authorization: `token ${token}` },
-  });
-  if (res.ok) return await res.text();
-  return '';
+  const content = await getFileAtRef(token, owner, repo, 'README.md', branch);
+  return content ?? '';
 }
 
 /**

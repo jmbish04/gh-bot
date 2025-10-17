@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 // src/modules/github_commit_service.ts
-import { ghREST } from './github_helpers'
+import { ghREST } from '../github'
 
 type Env = {
   DB: D1Database

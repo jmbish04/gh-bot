@@ -226,3 +226,68 @@ export function renderStyleguide(summary: RepoSummary, existing?: string | null)
 
   return output.trim() + "\n";
 }
+
+export interface GeminiModel {
+  generateContent(prompt: string): Promise<{ response: { text(): string } }>;
+}
+
+export interface GeminiEnv {
+  AI?: { run: (model: string, input: Record<string, unknown>) => Promise<unknown> };
+  SUMMARY_CF_MODEL?: string;
+}
+
+const DEFAULT_GEMINI_MODEL = "@cf/google/gemini-1.5-flash";
+
+/**
+ * Creates a lightweight Gemini model wrapper backed by the Workers AI binding.
+ *
+ * @param env - The environment containing the Workers AI binding and optional model override.
+ * @returns A helper exposing a `generateContent` method compatible with existing call sites.
+ * @throws {Error} When the Workers AI binding is missing or invalid.
+ * @example
+ * ```ts
+ * const model = getGeminiModel(env);
+ * const result = await model.generateContent('Summarize this repository.');
+ * console.log(result.response.text());
+ * ```
+ */
+export function getGeminiModel(env: GeminiEnv): GeminiModel {
+  if (!env.AI || typeof env.AI.run !== "function") {
+    throw new Error("Workers AI binding (env.AI) is required to use getGeminiModel.");
+  }
+
+  const model = env.SUMMARY_CF_MODEL ?? DEFAULT_GEMINI_MODEL;
+
+  return {
+    async generateContent(prompt: string) {
+      const result = await env.AI.run(model, {
+        messages: [
+          { role: "system", content: "You are a meticulous GitHub research assistant." },
+          { role: "user", content: prompt },
+        ],
+        max_output_tokens: 2048,
+      });
+
+      let text: string;
+      if (typeof result === "string") {
+        text = result;
+      } else if (result && typeof (result as any).response === "string") {
+        text = (result as any).response;
+      } else if (result && typeof (result as any).response?.text === "function") {
+        text = (result as any).response.text();
+      } else if (Array.isArray((result as any)?.messages)) {
+        const messages = (result as any).messages;
+        const last = messages[messages.length - 1];
+        text = typeof last?.content === "string" ? last.content : JSON.stringify(result);
+      } else {
+        text = JSON.stringify(result);
+      }
+
+      return {
+        response: {
+          text: () => text,
+        },
+      };
+    },
+  };
+}

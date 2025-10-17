@@ -1,5 +1,7 @@
 // src/modules/research.ts
 
+import { GitHubClient, getFileAtRef } from '../github'
+
 interface GitHubSearchResponse {
   total_count: number;
   incomplete_results: boolean;
@@ -20,21 +22,12 @@ interface GitHubSearchResult extends GitHubSearchResponse {
  */
 export async function ghSearchRepos(token: string, q: string, page=1): Promise<GitHubSearchResult> {
   const params = new URLSearchParams({ q, per_page: '30', page: String(page), sort: 'updated' })
-  const r = await fetch('https://api.github.com/search/repositories?'+params, {
-    headers: { 
-      Authorization: `token ${token}`, 
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'gh-bot-research/1.0'
-    }
-  })
-  const rateLimitRemaining = Number(r.headers.get('x-ratelimit-remaining') || '60')
-  
-  if (!r.ok) {
-    const errorText = await r.text()
-    throw new Error(`GitHub API error: ${r.status} ${r.statusText} - ${errorText}`)
-  }
-  
-  const data = await r.json() as GitHubSearchResponse
+  const client = new GitHubClient({ installationToken: token })
+  const { data, response } = await client.restWithResponse<GitHubSearchResponse>(
+    'GET',
+    `/search/repositories?${params.toString()}`
+  )
+  const rateLimitRemaining = Number(response.headers.get('x-ratelimit-remaining') || '60')
   return { ...data, rateLimitRemaining }
 }
 
@@ -52,11 +45,8 @@ export async function collectSignals(token: string, repo: any) {
     workersSpecificity: 0
   }
   try {
-    const res = await fetch(`https://raw.githubusercontent.com/${repo.owner.login}/${repo.name}/${repo.default_branch}/wrangler.toml`, {
-      headers: { Authorization: `token ${token}` }
-    })
-    if (res.ok) {
-      const txt = await res.text()
+    const txt = await getFileAtRef(token, repo.owner.login, repo.name, 'wrangler.toml', repo.default_branch)
+    if (txt) {
       signals.hasWrangler = true
       if (/\[\[d1_databases\]\]/i.test(txt)) signals.hasD1 = true
       if (/durable_objects/i.test(txt)) signals.hasDO = true
@@ -65,11 +55,8 @@ export async function collectSignals(token: string, repo: any) {
   } catch {}
   // quick code peek
   try {
-    const res2 = await fetch(`https://raw.githubusercontent.com/${repo.owner.login}/${repo.name}/${repo.default_branch}/src/index.ts`, {
-      headers: { Authorization: `token ${token}` }
-    })
-    if (res2.ok) {
-      const t = await res2.text()
+    const t = await getFileAtRef(token, repo.owner.login, repo.name, 'src/index.ts', repo.default_branch)
+    if (t) {
       if (/DurableObject/.test(t)) signals.hasDO = true
       if (/\/ai\/run\//.test(t) || /@cloudflare\/ai/.test(t)) signals.hasWorkersAI = true
       if (/scheduled\s*\(/.test(t)) signals.hasScheduled = true

@@ -12,7 +12,7 @@ import {
   callModelWithFallback,
   looksNonEnglish
 } from './ai_processing';
-import { ghREST } from './github_helpers';
+import { ghREST, getFileAtRef } from '../github';
 import { detectBindingsFromWrangler, detectEntrypoints, detectNotableDeps } from './repo_signals';
 
 /**
@@ -163,17 +163,19 @@ function pickImportantFiles(files: any[]) {
 }
 
 async function getRaw(token:string, owner:string, repo:string, path:string, ref:string, asArrayBuffer = false): Promise<string | ArrayBuffer> {
-  const url = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${path}`;
   try {
-    const r = await fetch(url, { headers: { Authorization: `token ${token}` } });
-    if (!r.ok) {
-      console.warn(`[GitHub] Failed to fetch raw file: ${url} (Status: ${r.status})`);
-      return '';
+    const text = await getFileAtRef(token, owner, repo, path, ref);
+    if (text == null) {
+      console.warn(`[GitHub] Failed to fetch raw file: ${owner}/${repo}/${path} @ ${ref}`);
+      return asArrayBuffer ? new ArrayBuffer(0) : '';
     }
-    return asArrayBuffer ? r.arrayBuffer() : r.text();
+    if (asArrayBuffer) {
+      return new TextEncoder().encode(text).buffer;
+    }
+    return text;
   } catch (e: any) {
-    console.error(`[GitHub] Error fetching raw file ${url}: ${e.message}`);
-    return '';
+    console.error(`[GitHub] Error fetching raw file ${owner}/${repo}/${path} @ ${ref}: ${e.message}`);
+    return asArrayBuffer ? new ArrayBuffer(0) : '';
   }
 }
 

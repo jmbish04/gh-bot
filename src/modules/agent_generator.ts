@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 // src/modules/agent_generator.ts
-import { ghREST } from './github_helpers'
+import { ghREST } from '../github'
 
 type Env = {
   DB: D1Database

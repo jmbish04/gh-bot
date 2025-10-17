@@ -1,6 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 // src/modules/project_detector.ts
-import { ghREST } from './github_helpers'
+import { ghREST } from '../github'
 
 type Env = {
   DB: D1Database
