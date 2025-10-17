@@ -33,7 +33,7 @@ interface RepositoryAnalysisResult {
   summaries: Record<string, string>;
   packageJson?: Record<string, unknown>;
   wranglerPath?: string;
-  wranglerConfig?: any;
+  wranglerConfig?: Record<string, unknown>;
   existingAgents?: string | null;
   existingStyle?: string | null;
 }
