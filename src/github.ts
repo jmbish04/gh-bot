@@ -1204,7 +1204,7 @@ export async function ensurePullRequestWithCommit(params: EnsurePullRequestParam
       'content-type': 'application/json',
     },
     body: JSON.stringify({
-      title: 'chore(agents): add/standardize agent instruction files + gemini config',
+      title: prTitle,
       head: branch,
       base: baseBranch,
       body: prBody,
