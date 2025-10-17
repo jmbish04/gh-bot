@@ -1338,7 +1338,7 @@ export class GitHubClient {
     const headers = new Headers(input ?? {});
     headers.set('accept', 'application/vnd.github+json');
     if (!headers.has('authorization')) {
-      headers.set('authorization', `token ${this.options.token}`);
+      headers.set('authorization', `Bearer ${this.options.token}`);
     }
     if (this.options.requestTag) {
       headers.set('x-request-tag', this.options.requestTag);
