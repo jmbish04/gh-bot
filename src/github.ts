@@ -1,326 +1,329 @@
-import { withRetries, type Logger, type RepositoryTarget } from "./util";
-
-export interface GitHubEnv {
-  GITHUB_TOKEN?: string;
-  GITHUB_APP_ID?: string;
-  GITHUB_APP_PRIVATE_KEY?: string;
-  GITHUB_INSTALLATION_ID?: string;
-  GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string;
-}
-
-export interface FileContent {
-  path: string;
-  sha: string | null;
-  content: string;
-  encoding: "utf-8";
-}
-
-export interface GitHubRepository {
-  default_branch: string;
-  name: string;
-  full_name: string;
-  owner: { login: string };
-}
-
-export interface PullRequestSummary {
-  number: number;
-  head: { ref: string };
-  body?: string | null;
-}
+// TODO(ch2): integrate methods and app refactors in next chunk
+/**
+ * A thin, centralized GitHub API client used across the worker runtime.
+ *
+ * The client wraps GitHub's REST and GraphQL endpoints to provide consistent
+ * error handling, pagination support, and authorization. Authentication favors
+ * GitHub App installation tokens when provided because they offer scoped,
+ * ephemeral credentials. If an installation token is absent, a personal access
+ * token can be used instead. All outgoing requests include the appropriate
+ * Authorization header and default to GitHub's canonical REST base URL unless a
+ * custom Enterprise Server origin is supplied.
+ */
 
 export interface GitHubClientOptions {
-  env: GitHubEnv;
-  logger: Logger;
+  installationToken?: string;
+  personalAccessToken?: string;
+  baseUrl?: string;
+  defaultPerPage?: number;
+  paginationSoftLimit?: number;
+  timeoutMs?: number;
+  requestTag?: string;
 }
 
-export interface CommitFile {
-  path: string;
-  content: string;
-  mode?: "100644" | "100755" | "040000" | "160000" | "120000";
+interface InternalGitHubClientOptions extends GitHubClientOptions {
+  baseUrl: string;
+  token: string;
 }
 
-interface TreeItem {
-  path: string;
-  mode: string;
-  type: "blob" | "tree" | "commit";
-  size?: number;
-  sha: string;
-  url: string;
+/**
+ * Error thrown when a GitHub REST request resolves with a non-2xx status code.
+ */
+export class GitHubHttpError extends Error {
+  public readonly status: number;
+  public readonly url: string;
+  public readonly body: unknown;
+  public readonly rateLimit: {
+    limit?: number;
+    remaining?: number;
+    reset?: number;
+    used?: number;
+  };
+  public readonly requestId?: string | null;
+
+  constructor(
+    message: string,
+    status: number,
+    url: string,
+    body: unknown,
+    headers: Headers
+  ) {
+    super(message);
+    this.name = 'GitHubHttpError';
+    this.status = status;
+    this.url = url;
+    this.body = body;
+    this.rateLimit = {
+      limit: parseHeaderInt(headers.get('x-ratelimit-limit')),
+      remaining: parseHeaderInt(headers.get('x-ratelimit-remaining')),
+      reset: parseHeaderInt(headers.get('x-ratelimit-reset')),
+      used: parseHeaderInt(headers.get('x-ratelimit-used')),
+    };
+    this.requestId = headers.get('x-github-request-id');
+  }
 }
 
-interface Commit {
-  sha: string;
-  tree: { sha: string };
-  parents: { sha: string }[];
+export interface GraphQLErrorPayload {
+  message: string;
+  [key: string]: unknown;
 }
 
-const API_BASE = "https://api.github.com";
+/**
+ * Error thrown when GitHub's GraphQL API returns an `errors` payload.
+ */
+export class GitHubGraphQLError extends Error {
+  public readonly errors: GraphQLErrorPayload[];
+  public readonly requestId?: string | null;
 
+  constructor(message: string, errors: GraphQLErrorPayload[], requestId?: string | null) {
+    super(message);
+    this.name = 'GitHubGraphQLError';
+    this.errors = errors;
+    this.requestId = requestId;
+  }
+}
+
+/**
+ * A reusable client for GitHub REST and GraphQL APIs.
+ */
 export class GitHubClient {
-  private readonly env: GitHubEnv;
-  private readonly logger: Logger;
+  private readonly options: InternalGitHubClientOptions;
 
-  constructor(options: GitHubClientOptions) {
-    this.env = options.env;
-    this.logger = options.logger;
+  constructor(options: GitHubClientOptions = {}) {
+    const token = selectToken(options);
+    if (!token) {
+      throw new Error('GitHubClient requires an installationToken or personalAccessToken.');
+    }
+
+    const baseUrl = (options.baseUrl ?? 'https://api.github.com').replace(/\/$/, '');
+
+    this.options = {
+      ...options,
+      baseUrl,
+      token,
+    };
   }
 
-  private getAuthToken(): string {
-    if (this.env.GITHUB_TOKEN) {
-      return this.env.GITHUB_TOKEN;
-    }
-    if (this.env.GITHUB_APP_PRIVATE_KEY) {
-      throw new Error("GitHub App authentication not yet implemented; provide GITHUB_TOKEN for now.");
-    }
-    throw new Error("No GitHub credentials configured");
+  /**
+   * Executes a REST request against GitHub and returns the parsed JSON payload.
+   *
+   * @param path - The API path or absolute URL to request.
+   * @param init - Optional request initialization overrides.
+   * @returns A promise resolving with the parsed JSON response body.
+   * @throws {GitHubHttpError} If GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const client = new GitHubClient({ installationToken });
+   * const repo = await client.request<{ default_branch: string }>(`/repos/org/repo`);
+   * ```
+   */
+  public async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const { data } = await this.fetchJson<T>(this.buildUrl(path), init);
+    return data;
   }
 
-  private async request<T>(path: string, init: RequestInit & { method: string; query?: Record<string, string> }): Promise<T> {
-    const url = new URL(`${API_BASE}${path}`);
-    if (init.query) {
-      for (const [key, value] of Object.entries(init.query)) {
-        url.searchParams.set(key, value);
+  /**
+   * Fetches all results from a paginated GitHub REST resource.
+   *
+   * @param path - The API path or absolute URL to request.
+   * @param searchParams - Optional initial search parameters to include.
+   * @param cap - Optional maximum number of items to return (defaults to paginationSoftLimit).
+   * @returns A promise resolving with the concatenated items from each page.
+   * @throws {GitHubHttpError} If any page returns a non-success status code.
+   * @example
+   * ```ts
+   * const issues = await client.requestPaginated<Issue>(`/repos/org/repo/issues`);
+   * ```
+   */
+  public async requestPaginated<T>(
+    path: string,
+    searchParams?: URLSearchParams,
+    cap?: number
+  ): Promise<T[]> {
+    const limit = cap ?? this.options.paginationSoftLimit ?? Number.POSITIVE_INFINITY;
+    const collected: T[] = [];
+
+    let nextUrl = this.buildUrl(path);
+    const params = new URLSearchParams(searchParams ?? '');
+    if (!params.has('per_page') && this.options.defaultPerPage) {
+      params.set('per_page', String(this.options.defaultPerPage));
+    }
+    if (params.toString()) {
+      nextUrl.search = params.toString();
+    }
+
+    while (nextUrl && collected.length < limit) {
+      const { data, response } = await this.fetchJson<unknown>(nextUrl, undefined);
+      if (!Array.isArray(data)) {
+        throw new TypeError('Paginated GitHub responses must be arrays.');
       }
+
+      for (const item of data as T[]) {
+        collected.push(item);
+        if (collected.length >= limit) {
+          break;
+        }
+      }
+
+      if (collected.length >= limit) {
+        break;
+      }
+
+      const linkHeader = response.headers.get('link');
+      const nextLink = parseLinkHeaderNext(linkHeader);
+      nextUrl = nextLink ? new URL(nextLink) : null;
     }
 
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${this.getAuthToken()}`,
-      "User-Agent": "cf-worker-agent-standardizer",
+    return collected.slice(0, limit);
+  }
+
+  /**
+   * Executes a GitHub GraphQL request using the configured authentication.
+   *
+   * @param query - The GraphQL query document string.
+   * @param variables - Optional variables to supply with the query.
+   * @returns A promise resolving with the `data` field of the GraphQL response.
+   * @throws {GitHubGraphQLError} If the response contains GraphQL errors.
+   * @throws {GitHubHttpError} If the HTTP status code is not successful.
+   * @example
+   * ```ts
+   * const data = await client.graphql<{ viewer: { login: string } }>(`query { viewer { login } }`);
+   * ```
+   */
+  public async graphql<T>(
+    query: string,
+    variables?: Record<string, unknown>
+  ): Promise<T> {
+    const graphqlUrl = this.buildGraphqlUrl();
+    const init: RequestInit = {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ query, variables }),
     };
 
-    const response = await withRetries(async () => {
-      const res = await fetch(url.toString(), {
-        ...init,
-        headers: { ...headers, ...(init.headers ?? {}) },
-      });
-
-      if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0") {
-        const reset = Number(res.headers.get("x-ratelimit-reset"));
-        const delay = Math.max(0, reset * 1000 - Date.now());
-        this.logger.warn("GitHub rate limit hit", { delay });
-        if (delay > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
-        throw new Error("GitHub rate limit");
-      }
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`GitHub request failed: ${res.status} ${res.statusText} - ${text}`);
-      }
-      if (res.status === 204) {
-        return null as T;
-      }
-      const data = (await res.json()) as T;
-      return data;
-    });
-
-    return response;
-  }
-
-  async getRepository(target: RepositoryTarget): Promise<GitHubRepository> {
-    return this.request<GitHubRepository>(`/repos/${target.owner}/${target.repo}`, { method: "GET" });
-  }
-
-  async getDefaultBranch(target: RepositoryTarget, fallback: string = "main"): Promise<string> {
-    try {
-      const repo = await this.getRepository(target);
-      return repo.default_branch ?? fallback;
-    } catch (error) {
-      this.logger.warn("Failed to load repository metadata, using fallback default branch", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return fallback;
-    }
-  }
-
-  async getBranchSha(target: RepositoryTarget, branch: string): Promise<string> {
-    const ref = await this.request<{ object: { sha: string } }>(
-      `/repos/${target.owner}/${target.repo}/git/ref/heads/${encodeURIComponent(branch)}`,
-      { method: "GET" }
-    );
-    return ref.object.sha;
-  }
-
-  async getCommit(target: RepositoryTarget, sha: string): Promise<Commit> {
-    return this.request<Commit>(`/repos/${target.owner}/${target.repo}/git/commits/${sha}`, { method: "GET" });
-  }
-
-  async listTree(target: RepositoryTarget, sha: string, recursive = false): Promise<TreeItem[]> {
-    const tree = await this.request<{ tree: TreeItem[] }>(
-      `/repos/${target.owner}/${target.repo}/git/trees/${sha}`,
-      { method: "GET", query: recursive ? { recursive: "1" } : undefined }
-    );
-    return tree.tree;
-  }
-
-  async getBlob(target: RepositoryTarget, sha: string): Promise<string> {
-    const blob = await this.request<{ content: string; encoding: string }>(
-      `/repos/${target.owner}/${target.repo}/git/blobs/${sha}`,
-      { method: "GET" }
-    );
-    if (blob.encoding !== "base64") {
-      throw new Error(`Unsupported blob encoding: ${blob.encoding}`);
-    }
-    return Buffer.from(blob.content, "base64").toString("utf-8");
-  }
-
-  async getFile(target: RepositoryTarget, path: string, ref: string): Promise<{ content: string; sha: string } | null> {
-    try {
-      const file = await this.request<{ content: string; encoding: string; sha: string }>(
-        `/repos/${target.owner}/${target.repo}/contents/${encodeURIComponent(path)}`,
-        { method: "GET", query: { ref } }
+    const { data, response } = await this.fetchJson<{
+      data: T;
+      errors?: GraphQLErrorPayload[];
+    }>(graphqlUrl, init);
+    if (data.errors && data.errors.length > 0) {
+      throw new GitHubGraphQLError(
+        'GitHub GraphQL request returned errors.',
+        data.errors,
+        response.headers.get('x-github-request-id')
       );
-      if (file.encoding !== "base64") {
-        throw new Error(`Unsupported encoding for file ${path}`);
-      }
-      return { content: Buffer.from(file.content, "base64").toString("utf-8"), sha: file.sha };
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("404")) {
-        return null;
-      }
-      throw error;
+    }
+
+    return data.data;
+  }
+
+  private buildUrl(path: string): URL {
+    try {
+      return new URL(path);
+    } catch {
+      const url = new URL(path.replace(/^[#?]/, ''), `${this.options.baseUrl}/`);
+      return url;
     }
   }
 
-  async findOpenStandardizationPr(target: RepositoryTarget): Promise<PullRequestSummary | null> {
-    const pulls = await this.request<PullRequestSummary[]>(
-      `/repos/${target.owner}/${target.repo}/pulls`,
-      { method: "GET", query: { state: "open", per_page: "50" } }
-    );
-    const match = pulls.find((pr) => pr.head.ref.startsWith("auto/standardize-agents-"));
-    return match ?? null;
+  private buildGraphqlUrl(): URL {
+    const base = new URL(`${this.options.baseUrl}/`);
+    if (/\/api\/v3\/?$/.test(base.pathname)) {
+      base.pathname = base.pathname.replace(/\/api\/v3\/?$/, '/api/graphql');
+      return base;
+    }
+
+    base.pathname = `${base.pathname.replace(/\/$/, '')}/graphql`;
+    return base;
   }
 
-  async createBranch(target: RepositoryTarget, newBranch: string, baseSha: string): Promise<void> {
-    await this.request(`/repos/${target.owner}/${target.repo}/git/refs`, {
-      method: "POST",
-      body: JSON.stringify({
-        ref: `refs/heads/${newBranch}`,
-        sha: baseSha,
-      }),
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  private async fetchJson<T>(url: URL, init?: RequestInit): Promise<{ data: T; response: Response }> {
+    const controller = this.options.timeoutMs ? new AbortController() : undefined;
+    const timeout = this.options.timeoutMs
+      ? setTimeout(() => controller?.abort(), this.options.timeoutMs)
+      : undefined;
 
-  async updateBranch(target: RepositoryTarget, branch: string, sha: string): Promise<void> {
-    await this.request(`/repos/${target.owner}/${target.repo}/git/refs/heads/${encodeURIComponent(branch)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ sha, force: false }),
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: controller?.signal ?? init?.signal,
+        headers: this.composeHeaders(init?.headers),
+      });
 
-  async createTree(target: RepositoryTarget, baseTree: string, files: CommitFile[]): Promise<string> {
-    const tree = await this.request<{ sha: string }>(
-      `/repos/${target.owner}/${target.repo}/git/trees`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          base_tree: baseTree,
-          tree: files.map((file) => ({
-            path: file.path,
-            mode: file.mode ?? "100644",
-            type: "blob",
-            content: file.content,
-          })),
-        }),
-        headers: { "Content-Type": "application/json" },
+      if (!response.ok) {
+        const text = await response.text();
+        const parsed = text ? safeParseJSON(text) : undefined;
+        throw new GitHubHttpError(
+          `GitHub request failed with status ${response.status}`,
+          response.status,
+          response.url,
+          parsed,
+          response.headers
+        );
       }
-    );
-    return tree.sha;
-  }
 
-  async createCommit(target: RepositoryTarget, params: { message: string; tree: string; parents: string[] }): Promise<string> {
-    const commit = await this.request<{ sha: string }>(
-      `/repos/${target.owner}/${target.repo}/git/commits`,
-      {
-        method: "POST",
-        body: JSON.stringify(params),
-        headers: { "Content-Type": "application/json" },
+      if (response.status === 204 || response.status === 205) {
+        return { data: undefined as T, response };
       }
-    );
-    return commit.sha;
-  }
 
-  async createPullRequest(target: RepositoryTarget, params: { title: string; head: string; base: string; body: string }): Promise<PullRequestSummary> {
-    const pr = await this.request<PullRequestSummary & { url: string }>(
-      `/repos/${target.owner}/${target.repo}/pulls`,
-      {
-        method: "POST",
-        body: JSON.stringify(params),
-        headers: { "Content-Type": "application/json" },
+      const text = await response.text();
+      const data = (text ? (safeParseJSON<T>(text) as T) : (undefined as T));
+      return { data, response };
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
       }
-    );
-    return pr;
+    }
   }
 
-  async updatePullRequest(target: RepositoryTarget, number: number, body: string): Promise<void> {
-    await this.request(`/repos/${target.owner}/${target.repo}/pulls/${number}`, {
-      method: "PATCH",
-      body: JSON.stringify({ body }),
-      headers: { "Content-Type": "application/json" },
-    });
+  private composeHeaders(input?: HeadersInit): Headers {
+    const headers = new Headers(input ?? {});
+    headers.set('accept', 'application/vnd.github+json');
+    if (!headers.has('authorization')) {
+      headers.set('authorization', `Bearer ${this.options.token}`);
+    }
+    if (this.options.requestTag) {
+      headers.set('x-request-tag', this.options.requestTag);
+    }
+    if (!headers.has('user-agent')) {
+      headers.set('user-agent', 'gh-bot-client');
+    }
+    return headers;
   }
 }
 
-export async function ensureBranchExists(
-  client: GitHubClient,
-  target: RepositoryTarget,
-  desiredBranch: string,
-  baseBranch: string,
-  logger: Logger
-): Promise<string> {
+function selectToken(options: GitHubClientOptions): string | undefined {
+  return options.installationToken ?? options.personalAccessToken;
+}
+
+function parseHeaderInt(value: string | null): number | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  const num = Number.parseInt(value, 10);
+  return Number.isNaN(num) ? undefined : num;
+}
+
+export function safeParseJSON<T = unknown>(text: string): T | string {
   try {
-    const sha = await client.getBranchSha(target, desiredBranch);
-    logger.debug("Reusing existing work branch", { desiredBranch, sha });
-    return sha;
-  } catch (error) {
-    logger.info("Creating work branch", { desiredBranch });
-    const baseSha = await client.getBranchSha(target, baseBranch);
-    await client.createBranch(target, desiredBranch, baseSha);
-    return baseSha;
+    return JSON.parse(text) as T;
+  } catch {
+    return text;
   }
 }
 
-export interface EnsurePullRequestParams {
-  client: GitHubClient;
-  target: RepositoryTarget;
-  baseBranch: string;
-  branch: string;
-  commitMessage: string;
-  files: CommitFile[];
-  logger: Logger;
-  prBody: string;
-  existingPr?: PullRequestSummary | null;
-}
+export function parseLinkHeaderNext(header: string | null): string | null {
+  if (!header) {
+    return null;
+  }
 
-export async function ensurePullRequestWithCommit(params: EnsurePullRequestParams): Promise<PullRequestSummary> {
-  const { client, target, baseBranch, branch, commitMessage, files, logger, prBody, existingPr } = params;
-  if (!files.length) {
-    throw new Error("No files to commit");
+  const parts = header.split(',');
+  for (const part of parts) {
+    const match = part.match(/<([^>]+)>;\s*rel="([^"]+)"/);
+    if (match && match[2] === 'next') {
+      return match[1];
+    }
   }
-  const baseSha = await client.getBranchSha(target, branch);
-  const baseCommit = await client.getCommit(target, baseSha);
-  const treeSha = await client.createTree(target, baseCommit.tree.sha, files);
-  const commitSha = await client.createCommit(target, {
-    message: commitMessage,
-    tree: treeSha,
-    parents: [baseSha],
-  });
-  await client.updateBranch(target, branch, commitSha);
-  if (existingPr) {
-    logger.info("Updating existing PR with new commit", { number: existingPr.number });
-    await client.updatePullRequest(target, existingPr.number, prBody);
-    return existingPr;
-  }
-  logger.info("Creating new pull request", { branch });
-  const title = "chore(agents): add/standardize agent instruction files + gemini config";
-  return client.createPullRequest(target, {
-    title,
-    head: branch,
-    base: baseBranch,
-    body: prBody,
-  });
+  return null;
 }
