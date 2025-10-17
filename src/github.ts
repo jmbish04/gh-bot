@@ -1,4 +1,5 @@
 // TODO(ch2): integrate methods and app refactors in next chunk
+import type { Logger, RepositoryTarget } from './util';
 /**
  * A thin, centralized GitHub API client used across the worker runtime.
  *
@@ -11,9 +12,19 @@
  * custom Enterprise Server origin is supplied.
  */
 
+export interface GitHubEnv {
+  GITHUB_TOKEN?: string;
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
+  GITHUB_INSTALLATION_ID?: string;
+  GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string;
+}
+
 export interface GitHubClientOptions {
   installationToken?: string;
   personalAccessToken?: string;
+  env?: GitHubEnv;
+  logger?: Logger;
   baseUrl?: string;
   defaultPerPage?: number;
   paginationSoftLimit?: number;
@@ -66,6 +77,18 @@ export class GitHubHttpError extends Error {
 export interface GraphQLErrorPayload {
   message: string;
   [key: string]: unknown;
+}
+
+export interface PullRequestSummary {
+  number: number;
+  head: { ref: string };
+  body?: string | null;
+}
+
+export interface CommitFile {
+  path: string;
+  content: string;
+  mode?: '100644' | '100755' | '040000' | '160000' | '120000';
 }
 
 /**
@@ -218,6 +241,705 @@ export class GitHubClient {
     return data.data;
   }
 
+  /**
+   * Resolves the default branch for a repository, falling back to a provided branch name when GitHub lacks the metadata.
+   *
+   * @param target - The repository coordinates to inspect.
+   * @param fallback - Optional branch name used when the API response omits a default branch (defaults to `main`).
+   * @returns The default branch name reported by GitHub or the provided fallback value.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const branch = await client.getDefaultBranch({ owner: 'octocat', repo: 'hello-world' }, 'main');
+   * console.log(branch);
+   * ```
+   */
+  public async getDefaultBranch(target: RepositoryTarget, fallback = 'main'): Promise<string> {
+    const repo = await this.getRepository<{ default_branch?: string }>({ owner: target.owner, repo: target.repo });
+    return repo.default_branch ?? fallback;
+  }
+
+  /**
+   * Fetches the commit SHA that the provided branch currently points to.
+   *
+   * @param target - The repository coordinates to inspect.
+   * @param branch - The branch name to resolve.
+   * @returns The commit SHA for the requested branch.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const sha = await client.getBranchSha({ owner: 'octocat', repo: 'hello-world' }, 'main');
+   * console.log(sha);
+   * ```
+   */
+  public async getBranchSha(target: RepositoryTarget, branch: string): Promise<string> {
+    const data = await this.getBranch<{ commit: { sha: string } }>({ owner: target.owner, repo: target.repo, branch });
+    if (!data?.commit?.sha) {
+      throw new Error(`Branch ${branch} did not include a commit SHA.`);
+    }
+    return data.commit.sha;
+  }
+
+  /**
+   * Retrieves a Git commit payload, including parent references and tree information.
+   *
+   * @param target - The repository coordinates for the commit.
+   * @param sha - The commit SHA to fetch.
+   * @returns The Git commit payload returned by GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const commit = await client.getCommit({ owner: 'octocat', repo: 'hello-world' }, 'abc123');
+   * console.log(commit.tree.sha);
+   * ```
+   */
+  public getCommit<T = { sha: string; tree: { sha: string } }>(
+    target: RepositoryTarget,
+    sha: string
+  ): Promise<T> {
+    return this.request<T>(`/repos/${target.owner}/${target.repo}/git/commits/${sha}`);
+  }
+
+  /**
+   * Lists tree entries for a commit or tree SHA, optionally traversing recursively.
+   *
+   * @param target - The repository coordinates to query.
+   * @param sha - The tree or commit SHA to expand.
+   * @param recursive - When true, GitHub returns the complete recursive tree.
+   * @returns An array of tree entries.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const tree = await client.listTree({ owner: 'octocat', repo: 'hello-world' }, 'abc123', true);
+   * console.log(tree.length);
+   * ```
+   */
+  public async listTree<T = { path: string; mode: string; type: string; sha: string; size?: number }>(
+    target: RepositoryTarget,
+    sha: string,
+    recursive = false
+  ): Promise<T[]> {
+    const query = recursive ? '?recursive=1' : '';
+    const response = await this.request<{ tree: T[] }>(
+      `/repos/${target.owner}/${target.repo}/git/trees/${sha}${query}`
+    );
+    return response.tree;
+  }
+
+  /**
+   * Downloads and decodes a Git blob as UTF-8 text.
+   *
+   * @param target - The repository coordinates that contain the blob.
+   * @param sha - The blob SHA to fetch.
+   * @returns The decoded blob content as a UTF-8 string.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const text = await client.getBlob({ owner: 'octocat', repo: 'hello-world' }, 'blobSha');
+   * console.log(text.slice(0, 80));
+   * ```
+   */
+  public async getBlob(target: RepositoryTarget, sha: string): Promise<string> {
+    const blob = await this.request<{ content: string; encoding: string }>(
+      `/repos/${target.owner}/${target.repo}/git/blobs/${sha}`
+    );
+    if (blob.encoding !== 'base64') {
+      throw new Error(`Unsupported blob encoding: ${blob.encoding}`);
+    }
+    return decodeBase64(blob.content);
+  }
+
+  /**
+   * Reads a file from a repository and decodes it into UTF-8 text when present.
+   *
+   * @param target - The repository coordinates to query.
+   * @param path - The file path to read.
+   * @param ref - The branch, tag, or commit SHA to read from.
+   * @returns The decoded file contents and associated blob SHA, or null when the file is absent.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code other than 404.
+   * @example
+   * ```ts
+   * const file = await client.getFile({ owner: 'octocat', repo: 'hello-world' }, 'README.md', 'main');
+   * console.log(file?.sha);
+   * ```
+   */
+  public async getFile(
+    target: RepositoryTarget,
+    path: string,
+    ref: string
+  ): Promise<{ content: string; sha: string } | null> {
+    try {
+      const file = await this.request<{ content: string; encoding: string; sha: string }>(
+        `/repos/${target.owner}/${target.repo}/contents/${encodeGitHubPath(path)}` + `?ref=${encodeURIComponent(ref)}`
+      );
+      if (file.encoding !== 'base64') {
+        throw new Error(`Unsupported encoding for file ${path}`);
+      }
+      return { content: decodeBase64(file.content), sha: file.sha };
+    } catch (error) {
+      if (error instanceof GitHubHttpError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Finds the existing open standardization pull request created by this worker, if any.
+   *
+   * @param target - The repository coordinates to inspect.
+   * @returns The first matching pull request summary or null when none exist.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const pr = await client.findOpenStandardizationPr({ owner: 'octocat', repo: 'hello-world' });
+   * console.log(pr?.number);
+   * ```
+   */
+  public async findOpenStandardizationPr(target: RepositoryTarget): Promise<PullRequestSummary | null> {
+    const pulls = await this.request<PullRequestSummary[]>(
+      `/repos/${target.owner}/${target.repo}/pulls?state=open&per_page=50`
+    );
+    return pulls.find((pr) => pr.head.ref.startsWith('auto/standardize-agents-')) ?? null;
+  }
+
+  /**
+   * Fetches metadata for a specific repository so callers can inspect settings such as default branches or permissions.
+   *
+   * @param params - The owner and repository name to query.
+   * @returns A promise resolving with the repository payload returned by GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const repo = await gh.getRepository({ owner: 'octocat', repo: 'hello-world' });
+   * console.log(repo.default_branch);
+   * ```
+   */
+  public getRepository<T = unknown>({ owner, repo }: { owner: string; repo: string }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}`);
+  }
+
+  /**
+   * Lists repositories the current installation can access, enabling automation to iterate over every connected repo.
+   *
+   * @returns A promise resolving with the paginated installation repositories payload from GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const { repositories } = await gh.listRepositoriesForInstallation();
+   * console.log(repositories.map((repo) => repo.full_name));
+   * ```
+   */
+  public listRepositoriesForInstallation<T = unknown>(): Promise<{
+    total_count: number;
+    repositories: T[];
+  }> {
+    return this.request<{ total_count: number; repositories: T[] }>(`/installation/repositories`);
+  }
+
+  /**
+   * Retrieves a pull request's latest metadata such as title, branch refs, and mergeability.
+   *
+   * @param params - The owner, repository, and pull request number to read.
+   * @returns A promise resolving with the pull request payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const pr = await gh.getPullRequest({ owner: 'octocat', repo: 'hello-world', pull_number: 42 });
+   * console.log(pr.state);
+   * ```
+   */
+  public getPullRequest<T = unknown>({
+    owner,
+    repo,
+    pull_number,
+  }: {
+    owner: string;
+    repo: string;
+    pull_number: number;
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/pulls/${pull_number}`);
+  }
+
+  /**
+   * Lists the files touched by a pull request to support diff inspection or validation workflows.
+   *
+   * @param params - The owner, repository, and pull request number to inspect.
+   * @returns A promise resolving with every file item across all pages.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const files = await gh.listPullRequestFiles({ owner: 'octocat', repo: 'hello-world', pull_number: 42 });
+   * console.log(files.length);
+   * ```
+   */
+  public listPullRequestFiles<T = unknown>({
+    owner,
+    repo,
+    pull_number,
+  }: {
+    owner: string;
+    repo: string;
+    pull_number: number;
+  }): Promise<T[]> {
+    return this.requestPaginated<T>(`/repos/${owner}/${repo}/pulls/${pull_number}/files`);
+  }
+
+  /**
+   * Retrieves every review comment on a pull request, automatically traversing pagination to avoid missing feedback.
+   *
+   * @param params - The owner, repository, and pull request number to gather comments for.
+   * @returns A promise resolving with all review comments across every page.
+   * @throws {GitHubHttpError} When any page responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const comments = await gh.listPullRequestReviewComments({ owner: 'octocat', repo: 'hello-world', pull_number: 42 });
+   * console.log(comments.map((comment) => comment.id));
+   * ```
+   */
+  public listPullRequestReviewComments<T = unknown>({
+    owner,
+    repo,
+    pull_number,
+  }: {
+    owner: string;
+    repo: string;
+    pull_number: number;
+  }): Promise<T[]> {
+    return this.requestPaginated<T>(`/repos/${owner}/${repo}/pulls/${pull_number}/comments`);
+  }
+
+  /**
+   * Retrieves a single pull request review comment so callers can inspect or react to a specific thread entry.
+   *
+   * @param params - The owner, repository, and review comment identifier to fetch.
+   * @returns A promise resolving with the requested review comment payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const comment = await gh.getPullRequestReviewComment({ owner: 'octocat', repo: 'hello-world', comment_id: 123 });
+   * console.log(comment.body);
+   * ```
+   */
+  public getPullRequestReviewComment<T = unknown>({
+    owner,
+    repo,
+    comment_id,
+  }: {
+    owner: string;
+    repo: string;
+    comment_id: number;
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/pulls/comments/${comment_id}`);
+  }
+
+  /**
+   * Replies to an existing pull request review comment thread, enabling conversational feedback loops.
+   *
+   * @param params - The owner, repository, pull request number, target comment ID, and markdown body.
+   * @returns A promise resolving with the newly created review comment payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * await gh.replyToPullRequestReviewComment({
+   *   owner: 'octocat',
+   *   repo: 'hello-world',
+   *   pull_number: 42,
+   *   in_reply_to: 123,
+   *   body: 'Thanks for the suggestion!'
+   * });
+   * ```
+   */
+  public replyToPullRequestReviewComment<T = unknown>({
+    owner,
+    repo,
+    pull_number,
+    in_reply_to,
+    body,
+  }: {
+    owner: string;
+    repo: string;
+    pull_number: number;
+    in_reply_to: number;
+    body: string;
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/pulls/${pull_number}/comments`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ in_reply_to, body }),
+    });
+  }
+
+  /**
+   * Lists issues (and pull requests) for a repository, supporting optional state filtering for dashboards.
+   *
+   * @param params - The owner, repository, and optional issue state filter.
+   * @returns A promise resolving with every issue returned by the GitHub API.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const issues = await gh.listIssues({ owner: 'octocat', repo: 'hello-world', state: 'open' });
+   * console.log(issues.length);
+   * ```
+   */
+  public listIssues<T = unknown>({
+    owner,
+    repo,
+    state,
+  }: {
+    owner: string;
+    repo: string;
+    state?: 'open' | 'closed' | 'all';
+  }): Promise<T[]> {
+    const params = new URLSearchParams();
+    if (state) {
+      params.set('state', state);
+    }
+    return this.requestPaginated<T>(`/repos/${owner}/${repo}/issues`, params);
+  }
+
+  /**
+   * Retrieves a single issue (or pull request) by number to access its body, labels, or status.
+   *
+   * @param params - The owner, repository, and issue number to fetch.
+   * @returns A promise resolving with the issue payload from GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const issue = await gh.getIssue({ owner: 'octocat', repo: 'hello-world', issue_number: 101 });
+   * console.log(issue.title);
+   * ```
+   */
+  public getIssue<T = unknown>({
+    owner,
+    repo,
+    issue_number,
+  }: {
+    owner: string;
+    repo: string;
+    issue_number: number;
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/issues/${issue_number}`);
+  }
+
+  /**
+   * Creates a new GitHub issue to capture tasks, bug reports, or AI-generated follow-ups.
+   *
+   * @param params - The owner, repository, issue title, body, and optional labels payload.
+   * @returns A promise resolving with the created issue resource.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * await gh.createIssue({ owner: 'octocat', repo: 'hello-world', title: 'Bug report', body: 'Steps to reproduce' });
+   * ```
+   */
+  public createIssue<T = unknown>({
+    owner,
+    repo,
+    title,
+    body,
+    labels,
+  }: {
+    owner: string;
+    repo: string;
+    title: string;
+    body?: string;
+    labels?: string[];
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/issues`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ title, body, labels }),
+    });
+  }
+
+  /**
+   * Lists comments on a specific issue to support summarization or follow-up automation.
+   *
+   * @param params - The owner, repository, and issue number to inspect.
+   * @returns A promise resolving with every comment returned by the GitHub API.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const comments = await gh.listIssueComments({ owner: 'octocat', repo: 'hello-world', issue_number: 101 });
+   * console.log(comments.length);
+   * ```
+   */
+  public listIssueComments<T = unknown>({
+    owner,
+    repo,
+    issue_number,
+  }: {
+    owner: string;
+    repo: string;
+    issue_number: number;
+  }): Promise<T[]> {
+    return this.requestPaginated<T>(`/repos/${owner}/${repo}/issues/${issue_number}/comments`);
+  }
+
+  /**
+   * Retrieves the contents of a repository path, enabling bots to download README files or workflows.
+   *
+   * @param params - The owner, repository, file path, and optional ref to read.
+   * @returns A promise resolving with the content payload from GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const file = await gh.getContents({ owner: 'octocat', repo: 'hello-world', path: 'README.md' });
+   * console.log(file.encoding);
+   * ```
+   */
+  public getContents<T = unknown>({
+    owner,
+    repo,
+    path,
+    ref,
+  }: {
+    owner: string;
+    repo: string;
+    path: string;
+    ref?: string;
+  }): Promise<T> {
+    const encodedPath = encodeGitHubPath(path);
+    const query = ref ? `?ref=${encodeURIComponent(ref)}` : '';
+    return this.request<T>(`/repos/${owner}/${repo}/contents/${encodedPath}${query}`);
+  }
+
+  /**
+   * Updates or creates a file on a branch by committing new Base64-encoded contents.
+   *
+   * @param params - The owner, repository, file path, commit message, Base64 content, blob SHA, and optional branch name.
+   * @returns A promise resolving with the GitHub API response describing the commit.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * await gh.updateFile({
+   *   owner: 'octocat',
+   *   repo: 'hello-world',
+   *   path: 'README.md',
+   *   message: 'Update README',
+   *   content: btoa('# Hello world'),
+   *   sha: 'abc123'
+   * });
+   * ```
+   */
+  public updateFile<T = unknown>({
+    owner,
+    repo,
+    path,
+    message,
+    content,
+    sha,
+    branch,
+  }: {
+    owner: string;
+    repo: string;
+    path: string;
+    message: string;
+    content: string;
+    sha: string;
+    branch?: string;
+  }): Promise<T> {
+    const encodedPath = encodeGitHubPath(path);
+    return this.request<T>(`/repos/${owner}/${repo}/contents/${encodedPath}`, {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ message, content, sha, branch }),
+    });
+  }
+
+  /**
+   * Creates a Git commit object, typically used after constructing a tree for advanced workflows.
+   *
+   * @param params - The owner, repository, commit message, tree SHA, parent SHAs, and optional author/committer identities.
+   * @returns A promise resolving with the created commit payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const commit = await gh.createCommit({
+   *   owner: 'octocat',
+   *   repo: 'hello-world',
+   *   message: 'Automated commit',
+   *   tree: 'treeSha',
+   *   parents: ['parentSha']
+   * });
+   * console.log(commit.sha);
+   * ```
+   */
+  public createCommit<T = unknown>({
+    owner,
+    repo,
+    message,
+    tree,
+    parents,
+    author,
+    committer,
+  }: {
+    owner: string;
+    repo: string;
+    message: string;
+    tree: string;
+    parents: string[];
+    author?: Record<string, unknown>;
+    committer?: Record<string, unknown>;
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/git/commits`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ message, tree, parents, author, committer }),
+    });
+  }
+
+  /**
+   * Fetches metadata for a named branch, including its latest commit SHA, to support branch-aware logic.
+   *
+   * @param params - The owner, repository, and branch name to inspect.
+   * @returns A promise resolving with the branch payload from GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const branch = await gh.getBranch({ owner: 'octocat', repo: 'hello-world', branch: 'main' });
+   * console.log(branch.commit.sha);
+   * ```
+   */
+  public getBranch<T = unknown>({
+    owner,
+    repo,
+    branch,
+  }: {
+    owner: string;
+    repo: string;
+    branch: string;
+  }): Promise<T> {
+    const encodedBranch = encodeGitHubPath(branch);
+    return this.request<T>(`/repos/${owner}/${repo}/branches/${encodedBranch}`);
+  }
+
+  /**
+   * Creates a new branch (Git ref) pointing at a specific commit SHA.
+   *
+   * @param params - The owner, repository, fully-qualified ref name, and commit SHA.
+   * @returns A promise resolving with the newly created ref payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * await gh.createBranch({ owner: 'octocat', repo: 'hello-world', ref: 'refs/heads/feature', sha: 'abc123' });
+   * ```
+   */
+  public createBranch<T = unknown>({
+    owner,
+    repo,
+    ref,
+    sha,
+  }: {
+    owner: string;
+    repo: string;
+    ref: string;
+    sha: string;
+  }): Promise<T> {
+    return this.request<T>(`/repos/${owner}/${repo}/git/refs`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ ref, sha }),
+    });
+  }
+
+  /**
+   * Updates an existing Git ref, typically used to fast-forward or force-move branches.
+   *
+   * @param params - The owner, repository, ref path (without leading refs/), new commit SHA, and optional force flag.
+   * @returns A promise resolving with the updated ref payload.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * await gh.updateRef({ owner: 'octocat', repo: 'hello-world', ref: 'heads/main', sha: 'abc123', force: true });
+   * ```
+   */
+  public updateRef<T = unknown>({
+    owner,
+    repo,
+    ref,
+    sha,
+    force,
+  }: {
+    owner: string;
+    repo: string;
+    ref: string;
+    sha: string;
+    force?: boolean;
+  }): Promise<T> {
+    const normalizedRef = ref.replace(/^refs\//, '');
+    const encodedRef = encodeGitHubPath(normalizedRef);
+    return this.request<T>(`/repos/${owner}/${repo}/git/refs/${encodedRef}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ sha, force }),
+    });
+  }
+
+  /**
+   * Retrieves metadata for a GitHub user, enabling attribution or permission checks.
+   *
+   * @param params - The username to look up.
+   * @returns A promise resolving with the user payload from GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const user = await gh.getUser({ username: 'octocat' });
+   * console.log(user.id);
+   * ```
+   */
+  public getUser<T = unknown>({ username }: { username: string }): Promise<T> {
+    return this.request<T>(`/users/${username}`);
+  }
+
+  /**
+   * Retrieves metadata for a GitHub organization such as members-only visibility or plan details.
+   *
+   * @param params - The organization login to inspect.
+   * @returns A promise resolving with the organization payload from GitHub.
+   * @throws {GitHubHttpError} When GitHub responds with a non-success status code.
+   * @example
+   * ```ts
+   * const gh = new GitHubClient({ installationToken });
+   * const org = await gh.getOrg({ org: 'github' });
+   * console.log(org.billing_email);
+   * ```
+   */
+  public getOrg<T = unknown>({ org }: { org: string }): Promise<T> {
+    return this.request<T>(`/orgs/${org}`);
+  }
+
   private buildUrl(path: string): URL {
     try {
       return new URL(path);
@@ -293,8 +1015,28 @@ export class GitHubClient {
   }
 }
 
+function encodeGitHubPath(path: string): string {
+  return path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+function decodeBase64(content: string): string {
+  if (typeof atob === 'function') {
+    const binary = atob(content);
+    const length = binary.length;
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+  return Buffer.from(content, 'base64').toString('utf-8');
+}
+
 function selectToken(options: GitHubClientOptions): string | undefined {
-  return options.installationToken ?? options.personalAccessToken;
+  return options.installationToken ?? options.personalAccessToken ?? options.env?.GITHUB_TOKEN;
 }
 
 function parseHeaderInt(value: string | null): number | undefined {
@@ -326,4 +1068,148 @@ export function parseLinkHeaderNext(header: string | null): string | null {
     }
   }
   return null;
+}
+
+export interface EnsurePullRequestParams {
+  client: GitHubClient;
+  target: RepositoryTarget;
+  baseBranch: string;
+  branch: string;
+  commitMessage: string;
+  files: CommitFile[];
+  logger: Logger;
+  prBody: string;
+  existingPr?: PullRequestSummary | null;
+}
+
+/**
+ * Ensures a working branch exists for standardization tasks, creating it when missing.
+ *
+ * @param client - The GitHub client used for API interactions.
+ * @param target - The repository coordinates to manage.
+ * @param desiredBranch - The branch name to ensure.
+ * @param baseBranch - The branch the work branch should fork from when created.
+ * @param logger - Logger used for structured debug output.
+ * @returns The SHA of the branch head after ensuring it exists.
+ * @throws {GitHubHttpError} When GitHub responds with an unexpected error code.
+ * @example
+ * ```ts
+ * const sha = await ensureBranchExists(client, { owner: 'octocat', repo: 'hello-world' }, 'auto/work', 'main', logger);
+ * console.log(sha);
+ * ```
+ */
+export async function ensureBranchExists(
+  client: GitHubClient,
+  target: RepositoryTarget,
+  desiredBranch: string,
+  baseBranch: string,
+  logger: Logger
+): Promise<string> {
+  try {
+    const sha = await client.getBranchSha(target, desiredBranch);
+    logger.debug('Reusing existing work branch', { desiredBranch, sha });
+    return sha;
+  } catch (error) {
+    if (error instanceof GitHubHttpError && error.status !== 404) {
+      throw error;
+    }
+    logger.info('Creating work branch', { desiredBranch });
+    const baseSha = await client.getBranchSha(target, baseBranch);
+    await client.createBranch({
+      owner: target.owner,
+      repo: target.repo,
+      ref: `refs/heads/${desiredBranch}`,
+      sha: baseSha,
+    });
+    return baseSha;
+  }
+}
+
+/**
+ * Creates or updates a standardization pull request with a freshly committed tree.
+ *
+ * @param params - Complete configuration for the commit and PR workflow.
+ * @returns The pull request summary representing the ensured PR.
+ * @throws {GitHubHttpError} When GitHub responds with an unexpected error code.
+ * @example
+ * ```ts
+ * const pr = await ensurePullRequestWithCommit({
+ *   client,
+ *   target: { owner: 'octocat', repo: 'hello-world' },
+ *   baseBranch: 'main',
+ *   branch: 'auto/work',
+ *   commitMessage: 'chore: sync files',
+ *   files: [{ path: 'README.md', content: '# Hello' }],
+ *   logger,
+ *   prBody: 'Automated update',
+ * })
+ * ```
+ */
+export async function ensurePullRequestWithCommit(params: EnsurePullRequestParams): Promise<PullRequestSummary> {
+  const { client, target, baseBranch, branch, commitMessage, files, logger, prBody, existingPr } = params;
+  if (!files.length) {
+    throw new Error('No files to commit');
+  }
+
+  const branchSha = await client.getBranchSha(target, branch);
+  const baseCommit = await client.getCommit<{ tree: { sha: string } }>(target, branchSha);
+  const treeResponse = await client.request<{ sha: string }>(`/repos/${target.owner}/${target.repo}/git/trees`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      base_tree: baseCommit.tree.sha,
+      tree: files.map((file) => ({
+        path: file.path,
+        mode: file.mode ?? '100644',
+        type: 'blob',
+        content: file.content,
+      })),
+    }),
+  });
+
+  const commit = await client.createCommit<{ sha: string }>({
+    owner: target.owner,
+    repo: target.repo,
+    message: commitMessage,
+    tree: treeResponse.sha,
+    parents: [branchSha],
+  });
+
+  await client.updateRef({
+    owner: target.owner,
+    repo: target.repo,
+    ref: `heads/${branch}`,
+    sha: commit.sha,
+    force: false,
+  });
+
+  if (existingPr) {
+    logger.info('Updating existing PR with new commit', { number: existingPr.number });
+    await client.request(`/repos/${target.owner}/${target.repo}/pulls/${existingPr.number}`, {
+      method: 'PATCH',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ body: prBody }),
+    });
+    return existingPr;
+  }
+
+  logger.info('Creating new pull request', { branch });
+  const pr = await client.request<PullRequestSummary>(`/repos/${target.owner}/${target.repo}/pulls`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      title: 'chore(agents): add/standardize agent instruction files + gemini config',
+      head: branch,
+      base: baseBranch,
+      body: prBody,
+    }),
+  });
+
+  return pr;
 }

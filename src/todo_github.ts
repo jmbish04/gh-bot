@@ -1,3 +1,4 @@
+// superseded by src/github.ts; safe to remove in cleanup (chunk 3).
 /**
  * @fileoverview GitHub API Integration Module for Cloudflare Workers
  * 

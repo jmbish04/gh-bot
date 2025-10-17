@@ -1,5 +1,6 @@
 /// <reference types="@cloudflare/workers-types" />
 import { summarizePRWithAI } from './modules/ai_summary'
+import { GitHubClient } from './github'
 import {
   bookmarkSuggestion,
   createColbyCommand,
@@ -60,6 +61,7 @@ type Env = {
   CF_ACCOUNT_ID: string
   CF_API_TOKEN: string
   SUMMARY_CF_MODEL: string
+  GH_INSTALLATION_TOKEN?: string
   AI?: unknown
 }
 
@@ -428,9 +430,10 @@ export class PrWorkflow {
 
   private async harvestSuggestionsFromPR(token: string, owner: string, repo: string, prNumber: number, headSha: string): Promise<Record<string, string>> {
     try {
+      const gh = new GitHubClient({ installationToken: token || this.env.GH_INSTALLATION_TOKEN });
       // Get all review comments for this PR
-      const reviewComments = await ghREST(token, 'GET', `/repos/${owner}/${repo}/pulls/${prNumber}/comments`)
-      
+      const reviewComments = await gh.listPullRequestReviewComments({ owner, repo, pull_number: prNumber })
+
       // Also get general PR comments (issue comments on the PR)
       const issueComments = await ghREST(token, 'GET', `/repos/${owner}/${repo}/issues/${prNumber}/comments`)
 
@@ -1143,7 +1146,11 @@ export class PrWorkflow {
     if (!evt.installationId) {
       throw new Error('Missing installationId for extract suggestions command')
     }
+    if (!evt.prNumber) {
+      throw new Error('Missing prNumber for extract suggestions command')
+    }
     const token = await getInstallationToken(this.env, evt.installationId)
+    const gh = new GitHubClient({ installationToken: token || this.env.GH_INSTALLATION_TOKEN })
 
     await updateOperationProgress(this.env, operationId, {
       currentStep: 'Fetching PR review comments...',
@@ -1151,7 +1158,7 @@ export class PrWorkflow {
     })
 
     // Get all review comments for this PR
-    const reviewComments = await ghREST(token, 'GET', `/repos/${owner}/${repo}/pulls/${evt.prNumber}/comments`)
+    const reviewComments = await gh.listPullRequestReviewComments({ owner, repo, pull_number: evt.prNumber })
 
     if (!Array.isArray(reviewComments)) {
       throw new Error('Failed to fetch review comments')
@@ -1261,7 +1268,7 @@ export class PrWorkflow {
     })
 
     // Get all review comments for this PR
-    const reviewComments = await ghREST(token, 'GET', `/repos/${owner}/${repo}/pulls/${evt.prNumber}/comments`)
+    const reviewComments = await gh.listPullRequestReviewComments({ owner, repo, pull_number: evt.prNumber })
 
     if (!Array.isArray(reviewComments)) {
       throw new Error('Failed to fetch review comments')
@@ -1432,7 +1439,7 @@ export class PrWorkflow {
     })
 
     // Get all review comments for this PR
-    const reviewComments = await ghREST(token, 'GET', `/repos/${owner}/${repo}/pulls/${evt.prNumber}/comments`)
+    const reviewComments = await gh.listPullRequestReviewComments({ owner, repo, pull_number: evt.prNumber })
 
     if (!Array.isArray(reviewComments)) {
       throw new Error('Failed to fetch review comments')
