@@ -62,8 +62,8 @@
                 },
                 {
                         "binding": "REPO_MEMORY",
-                        "id": "<REPO_MEMORY_NAMESPACE_ID>",
-                        "preview_id": "<REPO_MEMORY_PREVIEW_ID>"
+                        "id": "a25b3ab8cd074bbbadab7fa0637f5e7f",
+                        "preview_id": "02bc104a3a1e4111884bbee0a4cd38fb"
                 }
         ],
         "send_email": [
