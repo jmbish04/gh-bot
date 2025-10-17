@@ -1,3 +1,4 @@
+// DEPRECATED: replaced by src/github.ts (migrated incrementally).
 import { Octokit } from '@octokit/rest';
 import jwt from '@tsndr/cloudflare-worker-jwt'; // small JWT for Workers
 
