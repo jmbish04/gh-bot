@@ -95,6 +95,7 @@ import { GitHubClient, ensureBranchExists, ensurePullRequestWithCommit, type Com
 import { introspectRepository } from "./introspect";
 import { renderAgentBundle } from "./policy";
 import { mergeGeminiConfig, renderGeminiConfig, renderStyleguide } from "./gemini";
+import { runDailyDiscovery, runTargetedResearch } from './agents/research_agent';
 
 /**
  * Runtime bindings available to this Worker.
@@ -124,6 +125,7 @@ type Env = {
     VECTORIZE_INDEX: VectorizeIndex;
     USER_PREFERENCES: KVNamespace; // User preferences KV storage
     AGENT_DEBOUNCE?: KVNamespace;
+	SEB: SendEmail; // Send Email Binding
 };
 
 type HonoContext = Context<{ Bindings: Env }>;
@@ -4741,3 +4743,54 @@ app.get("/api/operations/:id/logs", async (c: HonoContext) => {
         return c.json({ error: 'Failed to fetch operation logs' }, 500);
     }
 });
+
+// New endpoint to trigger targeted research
+app.post('/research', async (c) => {
+  const { query, rounds = 5 } = await c.req.json<{ query: string; rounds?: number }>();
+  if (!query) {
+    return c.json({ error: 'Query is required' }, 400);
+  }
+
+  const id = c.env.RESEARCH_ORCHESTRATOR.newUniqueId();
+  const stub = c.env.RESEARCH_ORCHESTRATOR.get(id);
+
+  // Start the research in the background without waiting for it to complete
+  // The DO will handle the long-running task.
+  c.executionCtx.waitUntil(
+    stub.fetch(new Request(`https://worker.local/start`, {
+      method: 'POST',
+      body: JSON.stringify({ query, rounds }),
+      headers: { 'Content-Type': 'application/json' },
+    }))
+  );
+
+  return c.json({
+    message: 'Research task started.',
+    taskId: id.toString(),
+    statusUrl: `${c.req.url}/${id.toString()}`,
+  });
+});
+
+// Endpoint to check research status
+app.get('/research/:taskId', async (c) => {
+    const { taskId } = c.req.param();
+    const id = c.env.RESEARCH_ORCHESTRATOR.idFromString(taskId);
+    const stub = c.env.RESEARCH_ORCHESTRATOR.get(id);
+    const response = await stub.fetch(new Request(`https://worker.local/status`));
+    return c.json(await response.json());
+});
+
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return app.fetch(request, env, ctx);
+  },
+  // Add the scheduled handler for the cron trigger
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    switch (event.cron) {
+      case '0 12 * * *': // This runs at 12:00 UTC every day
+        ctx.waitUntil(runDailyDiscovery(env));
+        break;
+    }
+  },
+};
