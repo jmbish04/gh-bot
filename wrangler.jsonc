@@ -42,7 +42,12 @@
                         "new_classes": [
                                 "ResearchOrchestrator",
                                 "PrWorkflow",
-                                "ProfileScanner",
+                                "ProfileScanner"
+                        ]
+                },
+                {
+                        "tag": "add-repo-setup-coordinator",
+                        "new_classes": [
                                 "RepositorySetupCoordinator"
                         ]
                 }
