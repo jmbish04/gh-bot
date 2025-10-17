@@ -443,9 +443,9 @@ export class RepositorySetupCoordinator {
     const imports = new Set<string>();
     for (const [path, summary] of Object.entries(analysis.summaries)) {
       if (path.endsWith('.py')) {
-        const matches = summary.match(/import\s+([a-zA-Z0-9_\.]+)/g) ?? [];
-        for (const match of matches) {
-          const name = match.replace(/import\s+/, '').split('.')[0];
+        const importRegex = /^(?:from\s+([a-zA-Z0-9_.]+)|import\s+([a-zA-Z0-9_.]+))/gm;
+        for (const match of summary.matchAll(importRegex)) {
+          const name = (match[1] || match[2]).split('.')[0];
           if (name && !['os', 'sys', 'typing'].includes(name)) imports.add(name);
         }
       }
