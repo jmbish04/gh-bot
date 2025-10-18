@@ -109,6 +109,13 @@ export interface PullRequestSummary {
   body?: string | null;
 }
 
+interface PullRequestResponse {
+  title: string;
+  body: string | null;
+  head: { ref: string; sha: string };
+  base: { ref: string; sha: string };
+}
+
 export interface CommitFile {
   path: string;
   content: string;
@@ -1490,6 +1497,65 @@ export async function createInstallationClient(
   const token = await getInstallationToken(env, installationId, options);
   options.logger?.debug('Created installation client', { installationId });
   return new GitHubClient({ ...options, env, installationToken: token });
+}
+
+/**
+ * Determines whether the specified GitHub user has push access to a repository by consulting the
+ * collaborators permission endpoint.
+ */
+export async function checkUserHasPushAccess(
+  client: GitHubClient,
+  owner: string,
+  repo: string,
+  username: string
+): Promise<boolean> {
+  try {
+    const permission = await client.rest<{ permission?: string }>(
+      'GET',
+      `/repos/${owner}/${repo}/collaborators/${username}/permission`
+    );
+    const level = permission?.permission ?? 'read';
+    return level === 'admin' || level === 'maintain' || level === 'write';
+  } catch (error) {
+    if (error instanceof GitHubHttpError && error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Posts a comment on a pull request via the GitHub issues comments endpoint.
+ */
+export async function postPRComment(
+  client: GitHubClient,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  body: string
+): Promise<{ comment_id: number; url: string }> {
+  const comment = await client.rest<{ id: number; html_url: string }>('POST', `/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+    body,
+  });
+  return { comment_id: comment.id, url: comment.html_url };
+}
+
+/**
+ * Retrieves branch metadata for a pull request including the head/base refs and SHAs.
+ */
+export async function getPRBranchDetails(
+  client: GitHubClient,
+  owner: string,
+  repo: string,
+  prNumber: number
+): Promise<{ headBranch: string; headSha: string; baseBranch: string; baseSha: string }> {
+  const pull = await client.rest<PullRequestResponse>('GET', `/repos/${owner}/${repo}/pulls/${prNumber}`);
+  return {
+    headBranch: pull.head.ref,
+    headSha: pull.head.sha,
+    baseBranch: pull.base.ref,
+    baseSha: pull.base.sha,
+  };
 }
 
 /**

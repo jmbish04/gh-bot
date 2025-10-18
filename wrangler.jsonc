@@ -33,6 +33,10 @@
                         {
                                 "name": "REPO_SETUP",
                                 "class_name": "RepositorySetupCoordinator"
+                        },
+                        {
+                                "name": "CONFLICT_RESOLVER",
+                                "class_name": "ConflictResolver"
                         }
                 ]
         },
@@ -50,6 +54,18 @@
                         "new_classes": [
                                 "RepositorySetupCoordinator"
                         ]
+                },
+                {
+                        "tag": "add-conflict-resolver",
+                        "new_classes": [
+                                "ConflictResolver"
+                        ]
+                }
+        ],
+        "services": [
+                {
+                        "binding": "Sandbox",
+                        "service": "cloudflare-sandbox"
                 }
         ],
         "d1_databases": [
