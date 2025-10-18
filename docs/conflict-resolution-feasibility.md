@@ -41,7 +41,7 @@ The feature is **feasible and recommended** when approached incrementally.
 ## Implementation Roadmap
 
 1. **Phase 1 – MVP (1–2 weeks)**
-   - Parse PR comments for `@colby/please fix code conflicts`.
+   - Parse PR comments for `/colby resolve conflicts`.
    - Launch a sandbox task to clone the repository, check out the PR branch, and attempt a merge with the base branch.
    - Extract conflict regions, summarize them, and request AI-generated suggestions.
    - Post a comment with the proposal and store the operation in D1.
