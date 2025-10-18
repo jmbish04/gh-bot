@@ -55,6 +55,7 @@ import { PrWorkflow } from "./do_pr_workflows";
 import { ProfileScanner } from "./do_profile_scanner";
 import { ResearchOrchestrator } from "./do_research";
 import { RepositorySetupCoordinator } from "./do_repo_setup";
+import "./do_conflict_resolver";
 // Import new Colby service modules
 import { generateAgentAssets } from "./modules/agent_generator";
 import { summarizeRepo } from "./modules/ai";
@@ -130,6 +131,8 @@ type Env = {
     REPO_SETUP: DurableObjectNamespace;
     ASSETS: Fetcher; // Static assets binding
     AI: any; // Workers AI binding
+    CONFLICT_RESOLVER: DurableObjectNamespace;
+    Sandbox?: Fetcher;
     VECTORIZE_INDEX: VectorizeIndex;
     USER_PREFERENCES: KVNamespace; // User preferences KV storage
     AGENT_DEBOUNCE?: KVNamespace;
@@ -162,6 +165,15 @@ function buildPrBody(actions: Map<string, string>): string {
     const header = "| File | Action |\n| --- | --- |";
     const rows = PR_FILE_ORDER.map((file) => `| ${file} | ${actions.get(file) ?? "unchanged"} |`).join("\n");
     return `${header}\n${rows}\n\n- Non-destructive merges preserved existing customizations.\n- Agent files synchronized and repo-aware.\n`;
+}
+
+function safeParseJson<T = unknown>(value: string, fallback: T = [] as unknown as T): T {
+    try {
+        return JSON.parse(value) as T;
+    } catch (error) {
+        console.warn("[MERGE OPS] Failed to parse JSON column", error);
+        return fallback;
+    }
 }
 
 async function handleRepoStandardization(
@@ -925,6 +937,65 @@ app.post("/manual/trigger-optimize", async (c: HonoContext) => {
             message: `Error: ${error instanceof Error ? error.message : String(error)}`
         }, 500);
     }
+});
+
+app.post("/api/merge-operations/status/:operationId", async (c: HonoContext) => {
+    const operationId = c.req.param("operationId");
+    if (!operationId) {
+        return c.json({ error: "operationId is required" }, 400);
+    }
+
+    const row = await c.env.DB.prepare(
+        `SELECT repo_owner, repo, pr_number, status
+         FROM merge_operations
+         WHERE id = ?`
+    ).bind(operationId).first();
+
+    if (!row) {
+        return c.json({ error: "Operation not found" }, 404);
+    }
+
+    try {
+        const resolverId = c.env.CONFLICT_RESOLVER.idFromName(`${row.repo_owner}/${row.repo}/${row.pr_number}`);
+        const resolver = c.env.CONFLICT_RESOLVER.get(resolverId);
+        const response = await resolver.fetch("https://conflict-resolver/status");
+        const state = response.ok ? await response.json() : { status: row.status };
+
+        return c.json({ operationId, state, status: row.status });
+    } catch (error) {
+        console.error("[MERGE STATUS] Failed to fetch DO status", error);
+        return c.json({
+            operationId,
+            status: row.status,
+            error: error instanceof Error ? error.message : String(error),
+        }, 502);
+    }
+});
+
+app.get("/api/merge-operations/:operationId", async (c: HonoContext) => {
+    const operationId = c.req.param("operationId");
+    if (!operationId) {
+        return c.json({ error: "operationId is required" }, 400);
+    }
+
+    const row = await c.env.DB.prepare(
+        `SELECT * FROM merge_operations WHERE id = ?`
+    ).bind(operationId).first();
+
+    if (!row) {
+        return c.json({ error: "Operation not found" }, 404);
+    }
+
+    const aiAnalysis = row.ai_analysis ? safeParseJson(row.ai_analysis) : [];
+    const conflictFiles = row.conflict_files ? safeParseJson(row.conflict_files) : [];
+
+    return c.json({
+        operation: {
+            ...row,
+            ai_analysis: aiAnalysis,
+            conflict_files: conflictFiles,
+        },
+    });
 });
 
 app.post("/github/webhook", async (c: HonoContext) => {

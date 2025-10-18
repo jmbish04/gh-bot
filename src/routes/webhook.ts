@@ -1,7 +1,18 @@
 // src/routes/webhook.ts
 import { verify as verifySignature } from '@octokit/webhooks-methods'
 import { ensureRepoMcpTools } from '../modules/mcp_tools'
-import { ghREST, GitHubHttpError } from '../github'
+import {
+  ghREST,
+  GitHubHttpError,
+  createInstallationClient,
+  GitHubClient,
+  checkUserHasPushAccess,
+  postPRComment,
+  getPRBranchDetails,
+} from '../github'
+import type { MergeConflictTrigger } from '../types/merge_conflicts'
+
+export const CONFLICT_MENTION_PATTERN = /(?:@colby|colby)[,:]?\s+(?:please\s+)?fix(?:\s+(?:the\s+)?code)?\s+conflicts?/i
 
 /**
  * Helper function to handle MCP tools setup for any repository event
@@ -30,11 +41,15 @@ type Env = {
   RESEARCH_ORCH?: DurableObjectNamespace
   AI?: any
   GITHUB_TOKEN?: string
+  GITHUB_APP_ID?: string
+  GITHUB_APP_PRIVATE_KEY?: string
   GITHUB_INSTALLATION_ID?: string
   GITHUB_REPO_DEFAULT_BRANCH_FALLBACK?: string
   AGENT_DEBOUNCE?: KVNamespace
   REPO_MEMORY?: KVNamespace
   CF_BINDINGS_MCP_URL?: string
+  CONFLICT_RESOLVER?: DurableObjectNamespace
+  Sandbox?: Fetcher
 }
 
 type WebhookData = {
@@ -726,6 +741,12 @@ async function onIssueComment(env: Env, delivery: string, p: any, startTime: num
   const body: string = p.comment.body || ''
   const triggers = parseTriggers(body)
 
+  if (p.action === 'created' && body && CONFLICT_MENTION_PATTERN.test(body)) {
+    await maybeTriggerConflictResolution(env, p).catch((error) => {
+      console.error('[WEBHOOK] Failed to trigger conflict resolver workflow', error)
+    })
+  }
+
   // Don't exit early - let the DO decide what to do
   const doId = env.PR_WORKFLOWS.idFromName(`${repo}#${prNumber}`)
   const stub = env.PR_WORKFLOWS.get(doId)
@@ -750,6 +771,136 @@ async function onIssueComment(env: Env, delivery: string, p: any, startTime: num
   })
   // Don't consume response body to avoid "Body has already been used" error
   return new Response('issue-comment-processed', { status: res.status })
+}
+
+async function maybeTriggerConflictResolution(env: Env, payload: any): Promise<void> {
+  if (!env.CONFLICT_RESOLVER) {
+    console.warn('[WEBHOOK] Conflict resolver durable object is not configured; skipping merge assistance')
+    return
+  }
+
+  const repoOwner = payload.repository.owner.login
+  const repoName = payload.repository.name
+  const prNumber = payload.issue.number
+  const commenter = payload.comment.user.login
+  const commentId = payload.comment.id
+
+  const alreadyProcessed = await env.DB.prepare(
+    'SELECT id FROM merge_operations WHERE trigger_comment_id = ? LIMIT 1',
+  )
+    .bind(commentId)
+    .first()
+
+  if (alreadyProcessed) {
+    console.log('[WEBHOOK] Merge conflict resolution already triggered for comment', commentId)
+    return
+  }
+
+  const recentlyTriggered = await hasRecentMergeOperation(env, repoOwner, repoName, prNumber)
+  if (recentlyTriggered) {
+    console.log('[WEBHOOK] Merge conflict resolution deduplicated for PR', { repoOwner, repoName, prNumber })
+    return
+  }
+
+  const githubClient = await getGitHubClientForEvent(env, payload.installation?.id)
+  const hasAccess = await checkUserHasPushAccess(githubClient, repoOwner, repoName, commenter)
+  if (!hasAccess) {
+    await postPRComment(
+      githubClient,
+      repoOwner,
+      repoName,
+      prNumber,
+      "❌ You don't have push access to this branch. Ask a maintainer to trigger me instead.",
+    )
+    return
+  }
+
+  const branchDetails = await getPRBranchDetails(githubClient, repoOwner, repoName, prNumber)
+
+  const operationId = generateOperationId()
+  const projectRow = await env.DB.prepare(
+    'SELECT repo_id FROM projects WHERE full_name = ? LIMIT 1',
+  )
+    .bind(`${repoOwner}/${repoName}`)
+    .first()
+
+  await env.DB.prepare(
+    `INSERT INTO merge_operations (id, pr_id, pr_number, repo, repo_owner, triggered_by, trigger_comment_id, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+  )
+    .bind(
+      operationId,
+      projectRow?.repo_id ?? null,
+      prNumber,
+      repoName,
+      repoOwner,
+      commenter,
+      commentId,
+    )
+    .run()
+
+  const trigger: MergeConflictTrigger = {
+    owner: repoOwner,
+    repo: repoName,
+    prNumber,
+    prTitle: payload.issue.title ?? '',
+    prDescription: payload.issue.body ?? '',
+    triggeredBy: commenter,
+    commentId,
+    commentBody: payload.comment.body ?? '',
+    headBranch: branchDetails.headBranch,
+    baseBranch: branchDetails.baseBranch,
+    repoUrl: payload.repository.html_url ?? '',
+    cloneUrl: payload.repository.clone_url ?? payload.repository.git_url ?? '',
+  }
+
+  const resolverId = env.CONFLICT_RESOLVER.idFromName(`${repoOwner}/${repoName}/${prNumber}`)
+  const resolver = env.CONFLICT_RESOLVER.get(resolverId)
+  await resolver.fetch('https://conflict-resolver/resolve', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ operationId, trigger, installationId: payload.installation?.id ?? null }),
+  })
+
+  await postPRComment(
+    githubClient,
+    repoOwner,
+    repoName,
+    prNumber,
+    '🔄 Analyzing merge conflicts... I will share my suggestions shortly.',
+  )
+}
+
+async function hasRecentMergeOperation(env: Env, owner: string, repo: string, prNumber: number): Promise<boolean> {
+  const recent = await env.DB.prepare(
+    `SELECT id FROM merge_operations
+     WHERE repo_owner = ? AND repo = ? AND pr_number = ?
+       AND datetime(created_at) >= datetime('now', '-5 minutes')
+     ORDER BY created_at DESC
+     LIMIT 1`,
+  )
+    .bind(owner, repo, prNumber)
+    .first()
+
+  return Boolean(recent)
+}
+
+async function getGitHubClientForEvent(env: Env, installationId?: number | null): Promise<GitHubClient> {
+  if (installationId) {
+    return createInstallationClient(env, installationId)
+  }
+
+  if (env.GITHUB_TOKEN) {
+    return new GitHubClient({ personalAccessToken: env.GITHUB_TOKEN, env })
+  }
+
+  throw new Error('GitHub credentials are required to trigger conflict resolution')
+}
+
+function generateOperationId(): string {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2)
 }
 
 /**
