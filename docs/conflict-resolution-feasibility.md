@@ -30,7 +30,7 @@ The feature is **feasible and recommended** when approached incrementally.
 ### Feasible With Caveats
 
 - **Authentication & Permissions** – Provide the GitHub App token through Workers Secrets and ensure the app has `contents:write` and `pull_requests:write` scopes.
-- **Comment Triggers** – Extend the webhook handler to recognize commands such as `@colby/please fix code conflicts`, while preventing bot-comment loops and posting progress updates.
+- **Comment Triggers** – Extend the webhook handler to recognize commands such as `/colby resolve conflicts`, while preventing bot-comment loops and posting progress updates.
 - **Real-Time Feedback** – Stream sandbox output to logs; publish user-visible updates either by editing a PR comment or through the GitHub Checks API.
 
 ### Not Recommended For Full Automation
