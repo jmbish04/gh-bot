@@ -46,6 +46,18 @@
                                 "ProfileScanner",
                                 "RepositorySetupCoordinator"
                         ]
+                },
+                {
+                        "tag": "add-conflict-resolver",
+                        "new_classes": [
+                                "ConflictResolver"
+                        ]
+                }
+        ],
+        "services": [
+                {
+                        "binding": "Sandbox",
+                        "service": "cloudflare-sandbox"
                 }
         ],
         "d1_databases": [
