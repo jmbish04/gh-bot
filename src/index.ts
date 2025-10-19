@@ -939,7 +939,7 @@ app.post("/manual/trigger-optimize", async (c: HonoContext) => {
     }
 });
 
-app.post("/api/merge-operations/status/:operationId", async (c: HonoContext) => {
+app.get("/api/merge-operations/status/:operationId", async (c: HonoContext) => {
     const operationId = c.req.param("operationId");
     if (!operationId) {
         return c.json({ error: "operationId is required" }, 400);
