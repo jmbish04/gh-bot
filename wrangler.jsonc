@@ -19,39 +19,31 @@
         "durable_objects": {
                 "bindings": [
                         {
-                                "name": "RESEARCH_ORCH",
-                                "class_name": "ResearchOrchestrator"
+                                "name": "RepositoryActor",
+                                "class_name": "RepositoryActor"
                         },
                         {
-                                "name": "PR_WORKFLOWS",
-                                "class_name": "PrWorkflow"
+                                "name": "PullRequestActor",
+                                "class_name": "PullRequestActor"
                         },
                         {
-                                "name": "PROFILE_SCANNER",
-                                "class_name": "ProfileScanner"
-                        },
-                        {
-                                "name": "REPO_SETUP",
-                                "class_name": "RepositorySetupCoordinator"
-                        },
-                        {
-                                "name": "CONFLICT_RESOLVER",
-                                "class_name": "ConflictResolver"
+                                "name": "ResearchActor",
+                                "class_name": "ResearchActor"
                         }
                 ]
         },
         "migrations": [
                 {
-                        "tag": "v1",
+                        "tag": "v2_actor_refactor",
                         "new_classes": [
+                                "RepositoryActor",
+                                "PullRequestActor",
+                                "ResearchActor"
+                        ],
+                        "deleted_classes": [
                                 "ResearchOrchestrator",
                                 "PrWorkflow",
-                                "ProfileScanner"
-                        ]
-                },
-                {
-                        "tag": "add-repo-setup-coordinator",
-                        "new_classes": [
+                                "ProfileScanner",
                                 "RepositorySetupCoordinator"
                         ]
                 },
