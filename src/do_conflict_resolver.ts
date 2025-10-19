@@ -24,7 +24,7 @@ interface ResolveRequestBody {
 }
 
 interface StoredOperationState {
-  status: string
+  status: (typeof STATUS)[keyof typeof STATUS]
   conflicts?: SandboxConflictResult
   suggestions?: AISuggestion[]
   updatedAt: number
