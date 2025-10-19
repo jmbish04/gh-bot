@@ -8,10 +8,11 @@
         "build": "npx wrangler build",
         "migrate:remote": "npx wrangler d1 migrations apply DB --remote",
         "migrate:local": "npx wrangler d1 migrations apply DB --local",
-        "deploy": "pnpm run migrate:remote && pnpm run build && npx wrangler deploy", 
+        "deploy": "pnpm run migrate:remote && pnpm run build && npx wrangler deploy",
         "test": "vitest run"
     },
     "dependencies": {
+        "@cloudflare/actors": "0.0.1-beta.6",
         "@iarna/toml": "^2.2.5",
         "@octokit/rest": "^22.0.0",
         "@octokit/webhooks-methods": "^4.1.0",
