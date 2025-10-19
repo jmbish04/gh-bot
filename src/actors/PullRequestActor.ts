@@ -1,4 +1,6 @@
 import { Actor, Persist } from "@cloudflare/actors";
+import type { AlarmInvocationInfo } from "@cloudflare/workers-types";
+import type { WebhookEvent } from "@octokit/webhooks-types";
 import { GitHubClient, getInstallationToken } from "../github";
 
 export type PullRequestStatus = "open" | "closed" | "merged";
@@ -33,9 +35,18 @@ export class PullRequestActor extends Actor<Env> {
   @Persist
   private installationId: number | null = null;
 
-  async handleWebhookEvent(event: any) {
-    const repo = event.repository?.full_name as string | undefined;
-    const prNumber = event.pull_request?.number ?? event.issue?.number;
+  async initialize(name: string) {
+    await super.setName(name);
+  }
+
+  async handleWebhookEvent(event: WebhookEvent) {
+    const repo = "repository" in event ? event.repository?.full_name : undefined;
+    const prNumber =
+      "pull_request" in event && typeof event.pull_request?.number === "number"
+        ? event.pull_request.number
+        : "issue" in event && typeof event.issue?.number === "number"
+          ? event.issue.number
+          : undefined;
 
     if (repo && typeof repo === "string") {
       this.repoName = repo;
@@ -45,23 +56,26 @@ export class PullRequestActor extends Actor<Env> {
       this.prNumber = prNumber;
     }
 
-    if (event.installation?.id) {
+    if ("installation" in event && event.installation?.id) {
       this.installationId = event.installation.id;
     }
 
-    if (event.pull_request?.state) {
+    if ("pull_request" in event && event.pull_request?.state) {
       this.status = event.pull_request.state as PullRequestStatus;
     }
 
-    if (event.action === "closed" && event.pull_request?.merged) {
+    if (event.action === "closed" && "pull_request" in event && event.pull_request?.merged) {
       this.status = "merged";
     }
 
-    if (event.action === "synchronize" || event.action === "opened" || event.action === "ready_for_review") {
+    if (
+      (event.action === "synchronize" || event.action === "opened" || event.action === "ready_for_review") &&
+      "pull_request" in event
+    ) {
       await this.runAutomatedChecks();
     }
 
-    if (event.comment && event.action === "created") {
+    if ("comment" in event && event.comment && event.action === "created") {
       await this.runAutomatedChecks();
     }
 
@@ -114,12 +128,36 @@ export class PullRequestActor extends Actor<Env> {
 
     if (request.method === "POST") {
       const { method, params } = (await request.json()) as { method: string; params?: unknown[] };
-      const target = (this as Record<string, unknown>)[method];
-      if (typeof target !== "function") {
-        return new Response("Unknown method", { status: 404 });
+
+      const allowedMethods: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+        initialize: async (name: unknown) => {
+          if (typeof name !== "string") {
+            throw new Error("Actor name must be a string");
+          }
+          await this.initialize(name);
+        },
+        handleWebhookEvent: async (payload: unknown) => {
+          if (!payload || typeof payload !== "object") {
+            throw new Error("Webhook payload must be an object");
+          }
+          return this.handleWebhookEvent(payload as WebhookEvent);
+        },
+        runAutomatedChecks: async () => this.runAutomatedChecks(),
+        postComment: async (body: unknown) => {
+          if (typeof body !== "string") {
+            throw new Error("Comment body must be a string");
+          }
+          await this.postComment(body);
+        },
+        getStatus: async () => this.getStatus(),
+      };
+
+      const target = allowedMethods[method];
+      if (!target) {
+        return new Response("Unknown or disallowed method", { status: 404 });
       }
 
-      const result = await (target as (...args: unknown[]) => unknown).apply(this, params ?? []);
+      const result = await target(...(params ?? []));
       return Response.json(result ?? null);
     }
 
@@ -142,7 +180,7 @@ export class PullRequestActor extends Actor<Env> {
       const client = new GitHubClient({ personalAccessToken: token });
       const pr = await client.rest.pulls.get({ owner, repo, pull_number: this.prNumber });
 
-      this.status = (pr.data.merged_at ? "merged" : (pr.data.state as PullRequestStatus)) ?? "open";
+      this.status = pr.data.merged_at ? "merged" : (pr.data.state as PullRequestStatus);
       this.checkResults = {
         headSha: pr.data.head.sha,
         baseSha: pr.data.base.sha,
@@ -167,6 +205,15 @@ export class PullRequestActor extends Actor<Env> {
       default:
         throw new Error(`Unsupported workflow alarm type: ${payload.type}`);
     }
+  }
+
+  protected override async onAlarm(alarmInfo?: AlarmInvocationInfo) {
+    const payload = alarmInfo?.state?.payload as PullRequestAlarmPayload | undefined;
+    if (!payload) {
+      return;
+    }
+
+    await this.processWorkflowAlarm(payload);
   }
 
   private async getGitHubToken(): Promise<string | null> {

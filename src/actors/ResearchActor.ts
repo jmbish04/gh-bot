@@ -1,4 +1,5 @@
 import { Actor, Persist } from "@cloudflare/actors";
+import type { AlarmInvocationInfo } from "@cloudflare/workers-types";
 
 export type ResearchStatus = "pending" | "researching" | "complete" | "failed";
 
@@ -20,6 +21,10 @@ export class ResearchActor extends Actor<Env> {
 
   @Persist
   private step = 0;
+
+  async initialize(name: string) {
+    await super.setName(name);
+  }
 
   async startResearch(query: string) {
     if (!query) {
@@ -51,12 +56,29 @@ export class ResearchActor extends Actor<Env> {
 
     if (request.method === "POST") {
       const { method, params } = (await request.json()) as { method: string; params?: unknown[] };
-      const target = (this as Record<string, unknown>)[method];
-      if (typeof target !== "function") {
-        return new Response("Unknown method", { status: 404 });
+
+      const allowedMethods: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+        initialize: async (name: unknown) => {
+          if (typeof name !== "string") {
+            throw new Error("Actor name must be a string");
+          }
+          await this.initialize(name);
+        },
+        startResearch: async (query: unknown) => {
+          if (typeof query !== "string") {
+            throw new Error("Research query must be a string");
+          }
+          return this.startResearch(query);
+        },
+        getResults: async () => this.getResults(),
+      };
+
+      const target = allowedMethods[method];
+      if (!target) {
+        return new Response("Unknown or disallowed method", { status: 404 });
       }
 
-      const result = await (target as (...args: unknown[]) => unknown).apply(this, params ?? []);
+      const result = await target(...(params ?? []));
       return Response.json(result ?? null);
     }
 
@@ -86,6 +108,15 @@ export class ResearchActor extends Actor<Env> {
       console.error("[ResearchActor] Failed research step", error);
       this.status = "failed";
     }
+  }
+
+  protected override async onAlarm(alarmInfo?: AlarmInvocationInfo) {
+    const payload = alarmInfo?.state?.payload as ResearchAlarmPayload | undefined;
+    if (!payload) {
+      return;
+    }
+
+    await this.performResearchStep(payload);
   }
 }
 

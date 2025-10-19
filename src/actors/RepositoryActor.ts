@@ -1,4 +1,5 @@
 import { Actor, Persist } from "@cloudflare/actors";
+import type { AlarmInvocationInfo } from "@cloudflare/workers-types";
 
 export type RepositoryAnalysisStatus = "pending" | "in_progress" | "complete" | "failed";
 
@@ -35,6 +36,10 @@ export class RepositoryActor extends Actor<Env> {
 
   @Persist
   private isSetupComplete = false;
+
+  async initialize(name: string) {
+    await super.setName(name);
+  }
 
   async setupRepository(config: RepositorySetupConfig) {
     this.repoName = `${config.owner}/${config.repo}`;
@@ -77,17 +82,31 @@ export class RepositoryActor extends Actor<Env> {
     }
 
     if (request.method === "POST") {
-      const { method, params } = (await request.json()) as {
-        method: keyof RepositoryActor;
-        params?: unknown[];
+      const { method, params } = (await request.json()) as { method: string; params?: unknown[] };
+
+      const allowedMethods: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+        initialize: async (name: unknown) => {
+          if (typeof name !== "string") {
+            throw new Error("Actor name must be a string");
+          }
+          await this.initialize(name);
+        },
+        setupRepository: async (config: unknown) => {
+          if (!config || typeof config !== "object") {
+            throw new Error("Repository configuration must be an object");
+          }
+          return this.setupRepository(config as RepositorySetupConfig);
+        },
+        analyzeRepo: async () => this.analyzeRepo(),
+        getStatus: async () => this.getStatus(),
       };
 
-      const target = (this as Record<string, unknown>)[method as string];
-      if (typeof target !== "function") {
-        return new Response("Unknown method", { status: 404 });
+      const target = allowedMethods[method];
+      if (!target) {
+        return new Response("Unknown or disallowed method", { status: 404 });
       }
 
-      const result = await (target as (...args: unknown[]) => unknown).apply(this, params ?? []);
+      const result = await target(...(params ?? []));
       return Response.json(result ?? null);
     }
 
@@ -111,7 +130,8 @@ export class RepositoryActor extends Actor<Env> {
         await this.executeAnalysis();
         break;
       default:
-        throw new Error(`Unhandled repository alarm payload: ${(payload as { type: string }).type}`);
+        const _exhaustiveCheck: never = payload;
+        throw new Error(`Unhandled repository alarm payload: ${JSON.stringify(_exhaustiveCheck)}`);
     }
   }
 

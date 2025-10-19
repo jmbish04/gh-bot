@@ -107,7 +107,7 @@ async function invokeActor<T>(stub: DurableObjectStub, method: string, params: u
 
 async function prepareActorStub(namespace: DurableObjectNamespace, id: string) {
   const stub = namespace.get(namespace.idFromName(id));
-  await invokeActor(stub, "setName", [id]);
+  await invokeActor(stub, "initialize", [id]);
   return stub;
 }
 

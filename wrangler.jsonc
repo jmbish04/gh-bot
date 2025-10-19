@@ -34,6 +34,20 @@
         },
         "migrations": [
                 {
+                        "tag": "v1",
+                        "new_classes": [
+                                "ResearchOrchestrator",
+                                "PrWorkflow",
+                                "ProfileScanner"
+                        ]
+                },
+                {
+                        "tag": "add-repo-setup-coordinator",
+                        "new_classes": [
+                                "RepositorySetupCoordinator"
+                        ]
+                },
+                {
                         "tag": "v2_actor_refactor",
                         "new_classes": [
                                 "RepositoryActor",
