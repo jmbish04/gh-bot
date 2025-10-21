@@ -54,6 +54,10 @@ import { introspectRepository } from "./introspect";
 import { renderAgentBundle } from "./policy";
 import { mergeGeminiConfig, renderGeminiConfig, renderStyleguide } from "./gemini";
 import { runDailyDiscovery, runTargetedResearch } from './agents/research_agent';
+import RepositoryActor from './actors/RepositoryActor';
+import PullRequestActor from './actors/PullRequestActor';
+import ResearchActor from './actors/ResearchActor';
+import { ConflictResolver } from './do_conflict_resolver'; // ConflictResolver might be needed based on the migration
 
 /**
  * Runtime bindings available to this Worker.
@@ -920,5 +924,13 @@ app.post("/github/webhook", async (c: HonoContext) => {
 	}
 });
 
+// Export the Durable Objects
+export { RepositoryActor, PullRequestActor, ResearchActor, ConflictResolver };
 
-export default app;
+
+// The default export remains your Hono app or scheduled handler
+export default {
+  fetch: app.fetch,
+  // Make sure your scheduled handler is also exported if needed
+  // scheduled: async (controller, env, ctx) => { ... }
+};
