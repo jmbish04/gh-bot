@@ -916,7 +916,17 @@ app.post("/github/webhook", async (c: HonoContext) => {
 		const bodyText = await c.req.text();
 		console.log("[MAIN] Body read successfully, length:", bodyText.length);
 
-		return await handleWebhook(c, { delivery, event, signature, body: bodyText });
+		const webhookData = {
+		  delivery,
+		  event,
+		  signature,
+		  bodyText: bodyText, // The raw body text
+		  headers: c.req.header() // Pass all headers as a plain object
+		};
+
+	// Pass the structured data object and the environment, not the full context
+	return await handleWebhook(webhookData, c.env);
+		
 	} catch (error) {
 		const errStr = error instanceof Error ? error.message : String(error);
 		console.error("[MAIN] Unhandled exception in webhook handler", { error: errStr });
