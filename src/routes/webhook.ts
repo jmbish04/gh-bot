@@ -68,19 +68,29 @@ async function checkRecentDuplicate(env: Env, delivery: string, isCommentEvent: 
     // For comment events, allow reprocessing if it's been more than 5 minutes
     // For other events, be more strict (30 minutes)
     const timeThreshold = isCommentEvent ? 5 * 60 * 1000 : 30 * 60 * 1000
-    const cutoffTime = Date.now() - timeThreshold
-    
+
     const result = await env.DB.prepare(
-      'SELECT created_at FROM gh_events WHERE delivery_id = ?'
+      'SELECT received_at FROM github_webhook_events WHERE delivery_id = ?'
     ).bind(delivery).first()
-    
+
     if (!result) {
       return false // No existing record, allow processing
     }
-    
-    const lastProcessed = result.created_at as number
+
+    const receivedAt = result.received_at as string | number | null | undefined
+    const lastProcessed =
+      typeof receivedAt === 'number'
+        ? receivedAt
+        : receivedAt
+        ? Date.parse(receivedAt)
+        : NaN
+
+    if (!Number.isFinite(lastProcessed)) {
+      return false
+    }
+
     const timeSinceLastProcessed = Date.now() - lastProcessed
-    
+
     // Allow reprocessing if enough time has passed
     return timeSinceLastProcessed > timeThreshold
   } catch (error) {
@@ -241,30 +251,73 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
     return new Response('invalid JSON payload', { status: 400 })
   }
   const startTime = Date.now()
+  const payloadJson = JSON.stringify(payload)
+  const action = typeof payload.action === 'string' ? payload.action : null
+  const repo = payload.repository?.full_name ?? null
+  const author =
+    payload.sender?.login ??
+    payload.comment?.user?.login ??
+    payload.review?.user?.login ??
+    payload.pull_request?.user?.login ??
+    payload.issue?.user?.login ??
+    null
+
+  let associatedNumber: number | null = null
+  if (typeof payload.pull_request?.number === 'number') {
+    associatedNumber = payload.pull_request.number
+  } else if (typeof payload.issue?.number === 'number') {
+    associatedNumber = payload.issue.number
+  } else if (typeof payload.number === 'number') {
+    associatedNumber = payload.number
+  }
+
+  const receivedAt = new Date(startTime).toISOString()
+  let webhookEventId: number | null = null
 
   // Idempotency: check if we've seen this delivery recently
   console.log('[WEBHOOK] Checking for duplicate delivery:', delivery)
   try {
-    // First, try to insert the event
-    await env.DB.prepare(
-      'INSERT INTO gh_events (delivery_id, event, repo, pr_number, author, action, created_at, payload_json) VALUES (?,?,?,?,?,?,?,?)'
-    ).bind(delivery, event, '-', null, '-', '-', startTime, bodyText).run()
-    console.log('[WEBHOOK] Event recorded in database')
+    // First, try to insert the event with normalized metadata
+    const insertResult = await env.DB.prepare(
+      `INSERT INTO github_webhook_events (delivery_id, event_type, action, repo_full_name, author_login, associated_number, received_at, full_payload_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(delivery, event, action, repo, author, associatedNumber, receivedAt, payloadJson)
+      .run()
+
+    webhookEventId = insertResult?.meta?.last_row_id ?? null
+    console.log('[WEBHOOK] Event recorded in database with normalized schema')
   } catch (dbError) {
     // Check if this is a comment event that we should allow reprocessing
     const isCommentEvent = event === 'pull_request_review_comment' || event === 'issue_comment'
     const isRecentDuplicate = await checkRecentDuplicate(env, delivery, isCommentEvent)
-    
+
     if (isRecentDuplicate) {
       console.log('[WEBHOOK] Recent duplicate delivery detected, allowing reprocessing:', delivery)
-      // Update the existing record with new timestamp and payload
+      // Update the existing record with new timestamp, payload, and metadata
       await env.DB.prepare(
-        'UPDATE gh_events SET created_at = ?, payload_json = ? WHERE delivery_id = ?'
-      ).bind(startTime, bodyText, delivery).run()
+        `UPDATE github_webhook_events
+         SET received_at = ?, full_payload_json = ?, action = ?, repo_full_name = ?, author_login = ?, associated_number = ?
+         WHERE delivery_id = ?`
+      )
+        .bind(receivedAt, payloadJson, action, repo, author, associatedNumber, delivery)
+        .run()
+
+      const existing = await env.DB.prepare(
+        'SELECT id FROM github_webhook_events WHERE delivery_id = ?'
+      )
+        .bind(delivery)
+        .first()
+
+      webhookEventId = (existing?.id as number | undefined) ?? null
     } else {
       console.log('[WEBHOOK] Duplicate delivery detected:', delivery)
       return new Response('duplicate', { status: 200 })
     }
+  }
+
+  if (webhookEventId) {
+    await recordWebhookDetails(env, webhookEventId, event, payload, associatedNumber)
   }
 
   // Process event with enhanced logging
@@ -457,7 +510,7 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
   try {
     const processingTime = Date.now() - startTime
     await env.DB.prepare(`
-      UPDATE gh_events
+      UPDATE github_webhook_events
       SET response_status = ?, response_message = ?, processing_time_ms = ?, error_details = ?
       WHERE delivery_id = ?
     `).bind(responseStatus, responseMessage, processingTime, errorDetails, delivery).run()
@@ -1092,13 +1145,138 @@ async function onRepositoryCreated(env: Env, delivery: string, p: any, startTime
 
 // ---------- helpers ----------
 
+async function recordWebhookDetails(
+  env: Env,
+  webhookEventId: number,
+  eventType: string,
+  payload: any,
+  associatedNumber: number | null
+) {
+  try {
+    switch (eventType) {
+      case 'pull_request': {
+        const pr = payload.pull_request
+        if (!pr) return
+
+        await env.DB.prepare(
+          `INSERT INTO pull_request_details (
+            webhook_event_id, pr_github_id, pr_number, pr_title, pr_state, pr_merged,
+            pr_created_at, pr_updated_at, pr_closed_at, pr_merged_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(pr_github_id) DO UPDATE SET
+            webhook_event_id=excluded.webhook_event_id,
+            pr_number=excluded.pr_number,
+            pr_title=excluded.pr_title,
+            pr_state=excluded.pr_state,
+            pr_merged=excluded.pr_merged,
+            pr_created_at=excluded.pr_created_at,
+            pr_updated_at=excluded.pr_updated_at,
+            pr_closed_at=excluded.pr_closed_at,
+            pr_merged_at=excluded.pr_merged_at`
+        )
+          .bind(
+            webhookEventId,
+            pr.id,
+            pr.number,
+            pr.title,
+            pr.state,
+            pr.merged ? 1 : 0,
+            pr.created_at,
+            pr.updated_at,
+            pr.closed_at,
+            pr.merged_at
+          )
+          .run()
+        break
+      }
+      case 'pull_request_review': {
+        const review = payload.review
+        const prNumber =
+          typeof associatedNumber === 'number'
+            ? associatedNumber
+            : typeof payload.pull_request?.number === 'number'
+            ? payload.pull_request.number
+            : null
+
+        if (!review || typeof prNumber !== 'number') return
+
+        await env.DB.prepare(
+          `INSERT INTO pull_request_review_details (
+            webhook_event_id, review_github_id, pr_number, review_state, submitted_at, review_body
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(review_github_id) DO UPDATE SET
+            webhook_event_id=excluded.webhook_event_id,
+            pr_number=excluded.pr_number,
+            review_state=excluded.review_state,
+            submitted_at=excluded.submitted_at,
+            review_body=excluded.review_body`
+        )
+          .bind(
+            webhookEventId,
+            review.id,
+            prNumber,
+            review.state,
+            review.submitted_at,
+            review.body
+          )
+          .run()
+        break
+      }
+      case 'issue_comment':
+      case 'pull_request_review_comment': {
+        const comment = payload.comment
+        const issueNumber =
+          typeof associatedNumber === 'number'
+            ? associatedNumber
+            : typeof payload.issue?.number === 'number'
+            ? payload.issue.number
+            : typeof payload.pull_request?.number === 'number'
+            ? payload.pull_request.number
+            : null
+
+        if (!comment || typeof issueNumber !== 'number') return
+
+        const commentType = eventType === 'issue_comment' ? 'issue' : 'pull_request_review'
+
+        await env.DB.prepare(
+          `INSERT INTO comment_details (
+            webhook_event_id, comment_github_id, issue_number, comment_type, comment_body, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(comment_github_id) DO UPDATE SET
+            webhook_event_id=excluded.webhook_event_id,
+            issue_number=excluded.issue_number,
+            comment_type=excluded.comment_type,
+            comment_body=excluded.comment_body,
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at`
+        )
+          .bind(
+            webhookEventId,
+            comment.id,
+            issueNumber,
+            commentType,
+            comment.body,
+            comment.created_at,
+            comment.updated_at
+          )
+          .run()
+        break
+      }
+      default:
+        break
+    }
+  } catch (error) {
+    console.error(`[WEBHOOK] Failed to record detailed data for webhook ${webhookEventId}:`, error)
+  }
+}
+
 /**
  * Updates metadata for a GitHub event in the database.
  *
  * @param env - The environment bindings, including the database.
  * @param delivery - The unique delivery ID of the webhook event.
  * @param repo - The repository name in the format "owner/repo".
- * @param pr - The pull request number associated with the event.
+ * @param pr - The pull request or issue number associated with the event.
  * @param author - The author of the event.
  * @param action - The action performed in the event.
  */
@@ -1107,12 +1285,12 @@ async function updateEventMeta(
   delivery: string,
   repo: string,
   pr: number | null,
-  author: string,
-  action: string
+  author: string | null,
+  action: string | null
 ) {
   await env.DB.prepare(
-    `UPDATE gh_events SET repo=?, pr_number=?, author=?, action=? WHERE delivery_id=?`
-  ).bind(repo, pr, author, action, delivery).run()
+    `UPDATE github_webhook_events SET repo_full_name=?, associated_number=?, author_login=?, action=? WHERE delivery_id=?`
+  ).bind(repo, pr, author ?? null, action ?? null, delivery).run()
 }
 
 /**
