@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS github_webhook_events (
     associated_number INTEGER,
     received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     full_payload_json TEXT NOT NULL,
+    ai_context_payload_json TEXT, -- Smaller context forwarded to AI assistants
     response_status TEXT,
     response_message TEXT,
     processing_time_ms INTEGER,

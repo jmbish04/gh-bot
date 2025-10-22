@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Event Detail · gh-bot Monitoring</title>
+    <script src="https://cdn.tailwindcss.com" defer></script>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.5.2/flowbite.min.css"
+      integrity="sha512-ls4PRpkTcVxpKa+wVU+p+PM7HLszVd00ENIm0rtvpD4K1JkPFAtFzI43fJqlZLKF+Fku0X7m0h9a4i6Yeg+ANw=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+    <script src="/nav.js" defer></script>
+    <script src="/server.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.5.2/flowbite.min.js" defer></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 min-h-screen">
+    <nav id="site-nav"></nav>
+    <main class="max-w-6xl mx-auto px-4 py-10 space-y-8">
+      <header>
+        <p class="text-sm text-slate-400">Delivery</p>
+        <h1 id="detail-title" class="text-3xl font-semibold text-white">Loading…</h1>
+      </header>
+
+      <section id="event-meta" class="grid gap-4 md:grid-cols-2"></section>
+
+      <section id="normalized-data" class="hidden">
+        <div class="rounded-xl border border-slate-800 bg-slate-900/60 shadow-lg shadow-slate-950/30">
+          <header class="border-b border-slate-800 px-4 py-3">
+            <h2 class="text-lg font-semibold text-white">Normalized Data</h2>
+            <p class="text-sm text-slate-400">Structured records extracted from webhook payload.</p>
+          </header>
+          <pre id="normalized-data-json" class="overflow-x-auto px-4 py-4 text-xs leading-relaxed text-slate-200"></pre>
+        </div>
+      </section>
+
+      <section id="commands-section" class="hidden">
+        <div class="rounded-xl border border-slate-800 bg-slate-900/60 shadow-lg shadow-slate-950/30">
+          <header class="border-b border-slate-800 px-4 py-3">
+            <h2 class="text-lg font-semibold text-white">Automation Commands</h2>
+            <p class="text-sm text-slate-400">/colby commands triggered by this event.</p>
+          </header>
+          <div id="command-list" class="divide-y divide-slate-800/60"></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="rounded-xl border border-slate-800 bg-slate-900/60 shadow-lg shadow-slate-950/30">
+          <header class="border-b border-slate-800 px-4 py-3">
+            <h2 class="text-lg font-semibold text-white">Chain of Events</h2>
+            <p class="text-sm text-slate-400">Chronological log entries captured by the operation logger.</p>
+          </header>
+          <div id="chain-timeline" class="px-4 py-4 space-y-4 text-sm"></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="rounded-xl border border-slate-800 bg-slate-900/60 shadow-lg shadow-slate-950/30">
+          <header class="border-b border-slate-800 px-4 py-3 flex flex-wrap items-center gap-3">
+            <div>
+              <h2 class="text-lg font-semibold text-white">Payloads</h2>
+              <p class="text-sm text-slate-400">Compare the raw webhook payload with the truncated AI context.</p>
+            </div>
+            <div class="flex gap-2 ml-auto">
+              <button id="payload-tab-full" type="button" class="px-3 py-1 text-xs font-semibold rounded-full border border-sky-500/40 bg-sky-500/10 text-sky-200">Full Payload</button>
+              <button id="payload-tab-ai" type="button" class="px-3 py-1 text-xs font-semibold rounded-full border border-slate-700 text-slate-300 hover:border-sky-500/40 hover:text-sky-200">AI Context</button>
+            </div>
+          </header>
+          <div>
+            <pre id="payload-full" class="payload-viewer block overflow-x-auto px-4 py-4 text-xs leading-relaxed text-slate-200"></pre>
+            <pre id="payload-ai" class="payload-viewer hidden overflow-x-auto px-4 py-4 text-xs leading-relaxed text-slate-200"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      document.addEventListener('DOMContentLoaded', async () => {
+        const params = new URLSearchParams(window.location.search);
+        const deliveryId = params.get('deliveryId');
+        const titleEl = document.getElementById('detail-title');
+        const metaSection = document.getElementById('event-meta');
+        const normalizedSection = document.getElementById('normalized-data');
+        const normalizedPre = document.getElementById('normalized-data-json');
+        const commandsSection = document.getElementById('commands-section');
+        const commandList = document.getElementById('command-list');
+        const chainTimeline = document.getElementById('chain-timeline');
+        const payloadFull = document.getElementById('payload-full');
+        const payloadAi = document.getElementById('payload-ai');
+        const tabFull = document.getElementById('payload-tab-full');
+        const tabAi = document.getElementById('payload-tab-ai');
+        const { getEventDetail, formatTimestamp } = window.dashboardApi || {};
+
+        if (!deliveryId || !getEventDetail) {
+          if (titleEl) {
+            titleEl.textContent = 'Delivery not specified';
+          }
+          if (metaSection) {
+            metaSection.innerHTML = '<div class="rounded-xl border border-slate-800 bg-slate-900/50 p-6 text-sm text-slate-400">Include ?deliveryId=&lt;uuid&gt; in the URL to load an event.</div>';
+          }
+          return;
+        }
+
+        if (titleEl) {
+          titleEl.textContent = `Delivery: ${deliveryId}`;
+        }
+
+        function formatJson(value) {
+          try {
+            return JSON.stringify(typeof value === 'string' ? JSON.parse(value) : value, null, 2);
+          } catch (error) {
+            return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+          }
+        }
+
+        try {
+          const data = await getEventDetail(deliveryId);
+          const event = data.event || {};
+
+          if (metaSection) {
+            const metaCards = [
+              {
+                title: 'Event',
+                value: event.event_type || '—',
+                hint: event.action || '—',
+              },
+              {
+                title: 'Repository',
+                value: event.repo_full_name || '—',
+                hint: event.author_login ? `Author: ${event.author_login}` : null,
+              },
+              {
+                title: 'Status',
+                value: event.response_status || 'unknown',
+                hint: event.response_message || null,
+              },
+              {
+                title: 'Timing',
+                value: formatTimestamp(event.received_at),
+                hint: event.processing_time_ms ? `${event.processing_time_ms} ms` : null,
+              },
+            ];
+
+            metaSection.innerHTML = metaCards
+              .map((card) => `
+                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-5 shadow shadow-slate-950/40">
+                  <p class="text-xs uppercase tracking-[0.2em] text-slate-500">${card.title}</p>
+                  <p class="mt-2 text-lg font-semibold text-white">${card.value}</p>
+                  ${card.hint ? `<p class="mt-2 text-sm text-slate-400">${card.hint}</p>` : ''}
+                </div>
+              `)
+              .join('');
+          }
+
+          if (data.normalized_data && normalizedSection && normalizedPre) {
+            normalizedPre.textContent = formatJson(data.normalized_data);
+            normalizedSection.classList.remove('hidden');
+          }
+
+          if (Array.isArray(data.commands) && data.commands.length > 0 && commandsSection && commandList) {
+            commandsSection.classList.remove('hidden');
+            commandList.innerHTML = data.commands
+              .map((command) => {
+                const statusClass = command.status === 'failed'
+                  ? 'text-rose-300'
+                  : command.status === 'completed'
+                  ? 'text-emerald-300'
+                  : 'text-sky-300';
+                return `
+                  <div class="px-4 py-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <p class="text-sm font-semibold text-white">/${command.command}</p>
+                      <p class="text-xs text-slate-400">Triggered by @${command.author} on ${formatTimestamp(command.created_at)}</p>
+                    </div>
+                    <div class="text-sm ${statusClass}">${command.status}</div>
+                  </div>
+                `;
+              })
+              .join('');
+          }
+
+          if (chainTimeline) {
+            const logs = Array.isArray(data.chain_of_events) ? data.chain_of_events : [];
+            if (logs.length === 0) {
+              chainTimeline.innerHTML = '<p class="text-sm text-slate-500">No operation logs recorded for this delivery.</p>';
+            } else {
+              chainTimeline.innerHTML = logs
+                .map((log) => {
+                  const badgeClass =
+                    log.level === 'error'
+                      ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                      : log.level === 'warn'
+                      ? 'bg-amber-500/20 text-amber-200 border border-amber-500/40'
+                      : 'bg-sky-500/10 text-sky-200 border border-sky-500/40';
+                  const details = log.details && Object.keys(log.details).length > 0
+                    ? `<pre class="mt-3 rounded-lg bg-slate-950/60 px-3 py-2 text-xs text-slate-300 overflow-x-auto">${formatJson(log.details)}</pre>`
+                    : '';
+                  return `
+                    <div class="rounded-lg border border-slate-800/60 bg-slate-900/50 p-4">
+                      <div class="flex flex-wrap items-center gap-3">
+                        <span class="inline-flex items-center rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${badgeClass}">${log.level}</span>
+                        <span class="text-xs text-slate-400">${formatTimestamp(log.timestamp)}</span>
+                      </div>
+                      <p class="mt-2 text-sm text-white">${log.message}</p>
+                      ${details}
+                    </div>
+                  `;
+                })
+                .join('');
+            }
+          }
+
+          if (payloadFull) {
+            payloadFull.textContent = formatJson(data.payloads?.full ?? {});
+          }
+          if (payloadAi) {
+            payloadAi.textContent = formatJson(data.payloads?.truncated_for_ai ?? {});
+          }
+
+          function setActiveTab(tab) {
+            if (!payloadFull || !payloadAi || !tabFull || !tabAi) return;
+            if (tab === 'full') {
+              payloadFull.classList.remove('hidden');
+              payloadAi.classList.add('hidden');
+              tabFull.classList.add('bg-sky-500/10', 'border-sky-500/40', 'text-sky-200');
+              tabFull.classList.remove('border-slate-700', 'text-slate-300');
+              tabAi.classList.remove('bg-sky-500/10', 'border-sky-500/40', 'text-sky-200');
+              tabAi.classList.add('border-slate-700', 'text-slate-300');
+            } else {
+              payloadAi.classList.remove('hidden');
+              payloadFull.classList.add('hidden');
+              tabAi.classList.add('bg-sky-500/10', 'border-sky-500/40', 'text-sky-200');
+              tabAi.classList.remove('border-slate-700', 'text-slate-300');
+              tabFull.classList.remove('bg-sky-500/10', 'border-sky-500/40', 'text-sky-200');
+              tabFull.classList.add('border-slate-700', 'text-slate-300');
+            }
+          }
+
+          if (tabFull && tabAi) {
+            tabFull.addEventListener('click', () => setActiveTab('full'));
+            tabAi.addEventListener('click', () => setActiveTab('ai'));
+            setActiveTab('full');
+          }
+        } catch (error) {
+          if (metaSection) {
+            metaSection.innerHTML = `<div class="rounded-xl border border-slate-800 bg-slate-900/50 p-6 text-sm text-rose-300">Failed to load delivery ${deliveryId}: ${error.message}</div>`;
+          }
+        }
+      });
+    </script>
+  </body>
+</html>

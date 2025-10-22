@@ -60,6 +60,221 @@ type WebhookData = {
   headers: Record<string, string>
 }
 
+const MAX_CONTEXT_TEXT_LENGTH = 4000
+
+function truncateText(value: unknown, limit: number = MAX_CONTEXT_TEXT_LENGTH): string | undefined {
+  if (typeof value !== 'string') {
+    return typeof value === 'number' || typeof value === 'boolean' ? String(value) : undefined
+  }
+
+  if (value.length <= limit) {
+    return value
+  }
+
+  return value.slice(0, limit) + '…'
+}
+
+function simplifyUser(user: any) {
+  if (!user) return undefined
+  return {
+    login: user.login,
+    id: user.id,
+    type: user.type,
+    avatar_url: user.avatar_url,
+    html_url: user.html_url
+  }
+}
+
+function simplifyRepository(repo: any) {
+  if (!repo) return undefined
+  return {
+    id: repo.id,
+    name: repo.name,
+    full_name: repo.full_name,
+    default_branch: repo.default_branch,
+    private: repo.private,
+    html_url: repo.html_url,
+    owner: simplifyUser(repo.owner)
+  }
+}
+
+function extractRelevantData(eventType: string, payload: any) {
+  const relevant: Record<string, any> = {
+    event_type: eventType,
+    action: payload?.action,
+    repository: simplifyRepository(payload?.repository),
+    sender: simplifyUser(payload?.sender),
+    installation: payload?.installation ? { id: payload.installation.id } : undefined,
+    organization: payload?.organization
+      ? { id: payload.organization.id, login: payload.organization.login }
+      : undefined
+  }
+
+  switch (eventType) {
+    case 'pull_request': {
+      const pr = payload?.pull_request
+      relevant.pull_request = pr
+        ? {
+            id: pr.id,
+            number: pr.number,
+            title: truncateText(pr.title, 512),
+            state: pr.state,
+            merged: pr.merged,
+            draft: pr.draft,
+            mergeable: pr.mergeable,
+            created_at: pr.created_at,
+            updated_at: pr.updated_at,
+            merged_at: pr.merged_at,
+            base: pr.base
+              ? {
+                  ref: pr.base.ref,
+                  sha: pr.base.sha,
+                  repo: simplifyRepository(pr.base.repo)
+                }
+              : undefined,
+            head: pr.head
+              ? {
+                  ref: pr.head.ref,
+                  sha: pr.head.sha,
+                  repo: simplifyRepository(pr.head.repo)
+                }
+              : undefined,
+            user: simplifyUser(pr.user),
+            body: truncateText(pr.body)
+          }
+        : undefined
+      break
+    }
+    case 'pull_request_review': {
+      relevant.review = payload?.review
+        ? {
+            id: payload.review.id,
+            state: payload.review.state,
+            submitted_at: payload.review.submitted_at,
+            body: truncateText(payload.review.body)
+          }
+        : undefined
+      relevant.pull_request = payload?.pull_request
+        ? {
+            number: payload.pull_request.number,
+            title: truncateText(payload.pull_request.title, 512),
+            state: payload.pull_request.state,
+            user: simplifyUser(payload.pull_request.user)
+          }
+        : undefined
+      break
+    }
+    case 'pull_request_review_comment': {
+      const comment = payload?.comment
+      relevant.comment = comment
+        ? {
+            id: comment.id,
+            body: truncateText(comment.body),
+            diff_hunk: truncateText(comment.diff_hunk),
+            path: comment.path,
+            line: comment.line,
+            start_line: comment.start_line,
+            side: comment.side,
+            in_reply_to_id: comment.in_reply_to_id,
+            user: simplifyUser(comment.user),
+            html_url: comment.html_url,
+            created_at: comment.created_at,
+            updated_at: comment.updated_at
+          }
+        : undefined
+      relevant.pull_request = payload?.pull_request
+        ? {
+            number: payload.pull_request.number,
+            title: truncateText(payload.pull_request.title, 512),
+            state: payload.pull_request.state,
+            user: simplifyUser(payload.pull_request.user),
+            head: payload.pull_request.head
+              ? {
+                  ref: payload.pull_request.head.ref,
+                  sha: payload.pull_request.head.sha
+                }
+              : undefined,
+            base: payload.pull_request.base
+              ? {
+                  ref: payload.pull_request.base.ref,
+                  sha: payload.pull_request.base.sha
+                }
+              : undefined
+          }
+        : undefined
+      break
+    }
+    case 'issue_comment': {
+      relevant.issue = payload?.issue
+        ? {
+            id: payload.issue.id,
+            number: payload.issue.number,
+            title: truncateText(payload.issue.title, 512),
+            state: payload.issue.state,
+            user: simplifyUser(payload.issue.user),
+            pull_request: payload.issue.pull_request
+              ? {
+                  url: payload.issue.pull_request.url,
+                  merged_at: payload.issue.pull_request.merged_at
+                }
+              : undefined
+          }
+        : undefined
+      relevant.comment = payload?.comment
+        ? {
+            id: payload.comment.id,
+            body: truncateText(payload.comment.body),
+            user: simplifyUser(payload.comment.user),
+            html_url: payload.comment.html_url,
+            created_at: payload.comment.created_at,
+            updated_at: payload.comment.updated_at,
+            in_reply_to_id: payload.comment.in_reply_to_id
+          }
+        : undefined
+      break
+    }
+    case 'issues': {
+      relevant.issue = payload?.issue
+        ? {
+            id: payload.issue.id,
+            number: payload.issue.number,
+            title: truncateText(payload.issue.title, 512),
+            state: payload.issue.state,
+            user: simplifyUser(payload.issue.user),
+            body: truncateText(payload.issue.body)
+          }
+        : undefined
+      break
+    }
+    case 'repository': {
+      relevant.repository_event = payload?.repository
+        ? {
+            id: payload.repository.id,
+            name: payload.repository.name,
+            full_name: payload.repository.full_name,
+            private: payload.repository.private,
+            default_branch: payload.repository.default_branch,
+            created_at: payload.repository.created_at
+          }
+        : undefined
+      break
+    }
+    default: {
+      if (payload?.pull_request) {
+        relevant.pull_request = {
+          number: payload.pull_request.number,
+          title: truncateText(payload.pull_request.title, 512),
+          state: payload.pull_request.state,
+          user: simplifyUser(payload.pull_request.user)
+        }
+      }
+      break
+    }
+  }
+
+  return relevant
+}
+
 /**
  * Checks if a duplicate delivery should be allowed to reprocess
  */
@@ -252,6 +467,13 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
   }
   const startTime = Date.now()
   const payloadJson = JSON.stringify(payload)
+  const relevantPayload = extractRelevantData(event, payload)
+  let aiContextPayloadJson = '{}'
+  try {
+    aiContextPayloadJson = JSON.stringify(relevantPayload)
+  } catch (error) {
+    console.warn('[WEBHOOK] Failed to stringify AI context payload', error)
+  }
   const action = typeof payload.action === 'string' ? payload.action : null
   const repo = payload.repository?.full_name ?? null
   const author =
@@ -279,10 +501,10 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
   try {
     // First, try to insert the event with normalized metadata
     const insertResult = await env.DB.prepare(
-      `INSERT INTO github_webhook_events (delivery_id, event_type, action, repo_full_name, author_login, associated_number, received_at, full_payload_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO github_webhook_events (delivery_id, event_type, action, repo_full_name, author_login, associated_number, received_at, full_payload_json, ai_context_payload_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-      .bind(delivery, event, action, repo, author, associatedNumber, receivedAt, payloadJson)
+      .bind(delivery, event, action, repo, author, associatedNumber, receivedAt, payloadJson, aiContextPayloadJson)
       .run()
 
     webhookEventId = insertResult?.meta?.last_row_id ?? null
@@ -297,10 +519,10 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
       // Update the existing record with new timestamp, payload, and metadata
       await env.DB.prepare(
         `UPDATE github_webhook_events
-         SET received_at = ?, full_payload_json = ?, action = ?, repo_full_name = ?, author_login = ?, associated_number = ?
+         SET received_at = ?, full_payload_json = ?, ai_context_payload_json = ?, action = ?, repo_full_name = ?, author_login = ?, associated_number = ?
          WHERE delivery_id = ?`
       )
-        .bind(receivedAt, payloadJson, action, repo, author, associatedNumber, delivery)
+        .bind(receivedAt, payloadJson, aiContextPayloadJson, action, repo, author, associatedNumber, delivery)
         .run()
 
       const existing = await env.DB.prepare(
@@ -348,7 +570,7 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
       const context = {
         event,
         action: payload.action,
-        fullPayload: payload,
+        payload: relevantPayload,
         commentBody: commentBody,
         repo: payload.repository?.full_name,
         prNumber: payload.pull_request?.number,
@@ -358,15 +580,16 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
         isReviewComment: event === 'pull_request_review_comment',
         hasColbyCommand: commentBody.includes('/colby')
       }
-      
-      console.log('[WEBHOOK] AI context (full payload):', {
+
+      console.log('[WEBHOOK] AI context (truncated payload):', {
         event,
         action: payload.action,
         repo: payload.repository?.full_name,
         prNumber: payload.pull_request?.number,
         commentId: payload.comment?.id || payload.review?.id,
         hasColbyCommand: commentBody.includes('/colby'),
-        payloadSize: JSON.stringify(payload).length
+        fullPayloadSize: payloadJson.length,
+        aiContextSize: aiContextPayloadJson.length
       })
       
       const aiResponse = await (env.AI as any).run('@cf/meta/llama-4-scout-17b-16e-instruct', {

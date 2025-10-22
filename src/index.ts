@@ -1,4 +1,5 @@
 import { Hono, type Context } from "hono";
+import { serveStatic } from "hono/cloudflare-workers";
 import { verify as verifySignature } from "@octokit/webhooks-methods";
 // Durable Objects
 import { PrWorkflow } from "./do_pr_workflows";
@@ -117,13 +118,269 @@ function buildPrBody(actions: Map<string, string>): string {
 }
 
 function safeParseJson<T = unknown>(value: string, fallback: T = [] as unknown as T): T {
-	try {
-		return JSON.parse(value) as T;
-	} catch (error) {
-		console.warn("[MERGE OPS] Failed to parse JSON column", error);
-		return fallback;
-	}
+        try {
+                return JSON.parse(value) as T;
+        } catch (error) {
+                console.warn("[MERGE OPS] Failed to parse JSON column", error);
+                return fallback;
+        }
 }
+
+// --- Dashboard API Endpoints ---
+
+app.get("/api/dashboard/recent-activity", async (c: HonoContext) => {
+        const result = await c.env.DB.prepare(`
+                SELECT
+                        gwe.id,
+                        gwe.delivery_id,
+                        gwe.event_type,
+                        gwe.action,
+                        gwe.repo_full_name,
+                        gwe.author_login,
+                        gwe.received_at,
+                        gwe.response_status,
+                        pr.pr_title,
+                        pr.pr_state,
+                        cd.comment_body
+                FROM github_webhook_events AS gwe
+                LEFT JOIN pull_request_details AS pr ON pr.webhook_event_id = gwe.id
+                LEFT JOIN comment_details AS cd ON cd.webhook_event_id = gwe.id
+                ORDER BY datetime(gwe.received_at) DESC
+                LIMIT 25
+        `).all();
+
+        const events = ((result.results ?? []) as any[]).map((row) => ({
+                delivery_id: row.delivery_id,
+                event_type: row.event_type,
+                action: row.action,
+                repo_full_name: row.repo_full_name,
+                author_login: row.author_login,
+                received_at: row.received_at,
+                response_status: row.response_status,
+                title: row.pr_title,
+                state: row.pr_state,
+                comment_excerpt:
+                        typeof row.comment_body === "string"
+                                ? (row.comment_body as string).slice(0, 240)
+                                : null,
+        }));
+
+        return c.json({ events }, 200, CORS_HEADERS);
+});
+
+app.get("/api/dashboard/repositories", async (c: HonoContext) => {
+        const result = await c.env.DB.prepare(`
+                SELECT
+                        repo_full_name AS repo,
+                        COUNT(*) AS event_count,
+                        SUM(CASE WHEN response_status = 'error' THEN 1 ELSE 0 END) AS error_count
+                FROM github_webhook_events
+                WHERE repo_full_name IS NOT NULL
+                GROUP BY repo_full_name
+                ORDER BY event_count DESC
+        `).all();
+
+        const repositories = ((result.results ?? []) as any[]).map((row) => ({
+                repo: row.repo,
+                event_count: Number(row.event_count ?? 0),
+                error_count: Number(row.error_count ?? 0),
+        }));
+
+        return c.json({ repositories }, 200, CORS_HEADERS);
+});
+
+app.get("/api/dashboard/event-types", async (c: HonoContext) => {
+        const result = await c.env.DB.prepare(`
+                SELECT
+                        event_type AS event,
+                        COUNT(*) AS event_count,
+                        SUM(CASE WHEN response_status = 'error' THEN 1 ELSE 0 END) AS error_count
+                FROM github_webhook_events
+                GROUP BY event_type
+                ORDER BY event_count DESC
+        `).all();
+
+        const eventTypes = ((result.results ?? []) as any[]).map((row) => ({
+                event: row.event,
+                count: Number(row.event_count ?? 0),
+                error_count: Number(row.error_count ?? 0),
+        }));
+
+        return c.json({ event_types: eventTypes }, 200, CORS_HEADERS);
+});
+
+app.get("/api/repository/:owner/:repo", async (c: HonoContext) => {
+        const owner = decodeURIComponent(c.req.param("owner"));
+        const repoName = decodeURIComponent(c.req.param("repo"));
+        const repoFullName = `${owner}/${repoName}`;
+
+        const result = await c.env.DB.prepare(`
+                SELECT
+                        gwe.delivery_id,
+                        gwe.event_type,
+                        gwe.action,
+                        gwe.repo_full_name,
+                        gwe.author_login,
+                        gwe.received_at,
+                        gwe.response_status,
+                        pr.pr_title,
+                        pr.pr_state,
+                        cd.comment_body
+                FROM github_webhook_events AS gwe
+                LEFT JOIN pull_request_details AS pr ON pr.webhook_event_id = gwe.id
+                LEFT JOIN comment_details AS cd ON cd.webhook_event_id = gwe.id
+                WHERE gwe.repo_full_name = ?
+                ORDER BY datetime(gwe.received_at) DESC
+        `)
+                .bind(repoFullName)
+                .all();
+
+        const events = ((result.results ?? []) as any[]).map((row) => ({
+                delivery_id: row.delivery_id,
+                event_type: row.event_type,
+                action: row.action,
+                repo_full_name: row.repo_full_name,
+                author_login: row.author_login,
+                received_at: row.received_at,
+                response_status: row.response_status,
+                title: row.pr_title,
+                state: row.pr_state,
+                comment_excerpt:
+                        typeof row.comment_body === "string"
+                                ? (row.comment_body as string).slice(0, 240)
+                                : null,
+        }));
+
+        return c.json({ repo: repoFullName, events }, 200, CORS_HEADERS);
+});
+
+app.get("/api/event-type/:eventType", async (c: HonoContext) => {
+        const eventType = decodeURIComponent(c.req.param("eventType"));
+
+        const result = await c.env.DB.prepare(`
+                SELECT
+                        gwe.delivery_id,
+                        gwe.event_type,
+                        gwe.action,
+                        gwe.repo_full_name,
+                        gwe.author_login,
+                        gwe.received_at,
+                        gwe.response_status,
+                        pr.pr_title,
+                        pr.pr_state,
+                        cd.comment_body
+                FROM github_webhook_events AS gwe
+                LEFT JOIN pull_request_details AS pr ON pr.webhook_event_id = gwe.id
+                LEFT JOIN comment_details AS cd ON cd.webhook_event_id = gwe.id
+                WHERE gwe.event_type = ?
+                ORDER BY datetime(gwe.received_at) DESC
+        `)
+                .bind(eventType)
+                .all();
+
+        const events = ((result.results ?? []) as any[]).map((row) => ({
+                delivery_id: row.delivery_id,
+                event_type: row.event_type,
+                action: row.action,
+                repo_full_name: row.repo_full_name,
+                author_login: row.author_login,
+                received_at: row.received_at,
+                response_status: row.response_status,
+                title: row.pr_title,
+                state: row.pr_state,
+                comment_excerpt:
+                        typeof row.comment_body === "string"
+                                ? (row.comment_body as string).slice(0, 240)
+                                : null,
+        }));
+
+        return c.json({ event_type: eventType, events }, 200, CORS_HEADERS);
+});
+
+app.get("/api/event/:deliveryId", async (c: HonoContext) => {
+        const deliveryId = decodeURIComponent(c.req.param("deliveryId"));
+
+        const eventRow = await c.env.DB.prepare(
+                `SELECT * FROM github_webhook_events WHERE delivery_id = ?`
+        )
+                .bind(deliveryId)
+                .first();
+
+        if (!eventRow) {
+                return c.json({ error: "Event not found" }, 404, CORS_HEADERS);
+        }
+
+        const prDetails = await c.env.DB.prepare(
+                `SELECT * FROM pull_request_details WHERE webhook_event_id = ?`
+        )
+                .bind(eventRow.id)
+                .first();
+
+        const reviewDetails = await c.env.DB.prepare(
+                `SELECT * FROM pull_request_review_details WHERE webhook_event_id = ?`
+        )
+                .bind(eventRow.id)
+                .first();
+
+        const commentDetails = await c.env.DB.prepare(
+                `SELECT * FROM comment_details WHERE webhook_event_id = ?`
+        )
+                .bind(eventRow.id)
+                .first();
+
+        const normalizedData: Record<string, unknown> = {};
+        if (prDetails) {
+                normalizedData.pull_request = prDetails;
+        }
+        if (reviewDetails) {
+                normalizedData.pull_request_review = reviewDetails;
+        }
+        if (commentDetails) {
+                normalizedData.comment = commentDetails;
+        }
+
+        const commandsResult = await c.env.DB.prepare(
+                `SELECT * FROM colby_commands WHERE delivery_id = ? ORDER BY created_at ASC`
+        )
+                .bind(deliveryId)
+                .all();
+
+        const commands = (commandsResult.results ?? []) as any[];
+
+        const logsResult = await c.env.DB.prepare(
+                `SELECT log_level, message, details, timestamp
+                 FROM operation_logs
+                 WHERE operation_id = ?
+                 ORDER BY timestamp ASC`
+        )
+                .bind(deliveryId)
+                .all();
+
+        const chainOfEvents = ((logsResult.results ?? []) as any[]).map((row) => ({
+                timestamp: row.timestamp,
+                level: row.log_level,
+                message: row.message,
+                details: row.details ? safeParseJson(row.details, {}) : undefined,
+        }));
+
+        const { full_payload_json, ai_context_payload_json, ...eventMeta } = eventRow as any;
+
+        return c.json(
+                {
+                        event: eventMeta,
+                        normalized_data:
+                                Object.keys(normalizedData).length > 0 ? normalizedData : null,
+                        payloads: {
+                                full: full_payload_json,
+                                truncated_for_ai: ai_context_payload_json,
+                        },
+                        commands,
+                        chain_of_events: chainOfEvents,
+                },
+                200,
+                CORS_HEADERS
+        );
+});
 
 async function handleRepoStandardization(
 	env: Env,
@@ -891,10 +1148,10 @@ app.get("/api/merge-operations/:operationId", async (c: HonoContext) => {
 });
 
 app.post("/github/webhook", async (c: HonoContext) => {
-	console.log("[MAIN] Webhook request received", {
-		method: c.req.method,
-		url: c.req.url,
-		userAgent: c.req.header("user-agent"),
+        console.log("[MAIN] Webhook request received", {
+                method: c.req.method,
+                url: c.req.url,
+                userAgent: c.req.header("user-agent"),
 		contentType: c.req.header("content-type"),
 		contentLength: c.req.header("content-length"),
 		timestamp: new Date().toISOString(),
@@ -931,8 +1188,16 @@ app.post("/github/webhook", async (c: HonoContext) => {
 		const errStr = error instanceof Error ? error.message : String(error);
 		console.error("[MAIN] Unhandled exception in webhook handler", { error: errStr });
 		return c.json({ error: "Internal Server Error", message: errStr }, 500);
-	}
+        }
 });
+
+app.get(
+        "*",
+        serveStatic({
+                root: "./",
+                rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
+        })
+);
 
 // Export the Durable Objects
 export { RepositoryActor, PullRequestActor, ResearchActor, ConflictResolver };
