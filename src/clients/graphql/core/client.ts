@@ -56,7 +56,7 @@ export class GraphQLHttpClient {
       }
 
       const text = await response.text();
-      const parsed = text ? (safeParseJSON<{ data: T; errors?: any }>(text) as { data: T; errors?: any }) : { data: undefined as T };
+      const parsed = text ? safeParseJSON<{ data: T; errors?: GraphQLErrorPayload[] }>(text) : { data: undefined as T };
       return { data: parsed.data, errors: parsed.errors, response };
     } finally {
       if (timeout) {
