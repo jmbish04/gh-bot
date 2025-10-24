@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Event Type View · gh-bot Monitoring</title>
+    <script src="https://cdn.tailwindcss.com" defer></script>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.5.2/flowbite.min.css"
+      integrity="sha512-ls4PRpkTcVxpKa+wVU+p+PM7HLszVd00ENIm0rtvpD4K1JkPFAtFzI43fJqlZLKF+Fku0X7m0h9a4i6Yeg+ANw=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+    <script src="/nav.js" defer></script>
+    <script src="/server.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.5.2/flowbite.min.js" defer></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 min-h-screen">
+    <nav id="site-nav"></nav>
+    <main class="max-w-6xl mx-auto px-4 py-10 space-y-8">
+      <header>
+        <p class="text-sm text-slate-400">Event Type</p>
+        <h1 id="event-title" class="text-3xl font-semibold text-white">Loading…</h1>
+      </header>
+      <section id="action-filters" class="hidden">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-sm text-slate-400">Filter by action:</span>
+          <div id="action-buttons" class="flex flex-wrap gap-2"></div>
+        </div>
+      </section>
+      <section>
+        <div class="overflow-hidden rounded-xl border border-slate-800 bg-slate-900/60 shadow-xl shadow-slate-950/40">
+          <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-slate-800">
+              <thead class="bg-slate-900/80">
+                <tr>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Delivery</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Repository</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Action</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Author</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Status</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Received</th>
+                </tr>
+              </thead>
+              <tbody id="event-type-table" class="divide-y divide-slate-800/60">
+                <tr>
+                  <td colspan="6" class="px-4 py-8 text-center text-sm text-slate-400">Loading events…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script>
+      document.addEventListener('DOMContentLoaded', async () => {
+        const params = new URLSearchParams(window.location.search);
+        const eventParam = params.get('type');
+        const titleEl = document.getElementById('event-title');
+        const tableBody = document.getElementById('event-type-table');
+        const filterSection = document.getElementById('action-filters');
+        const filterButtons = document.getElementById('action-buttons');
+        const { getEventTypeEvents, formatTimestamp } = window.dashboardApi || {};
+
+        if (!eventParam || !getEventTypeEvents) {
+          if (titleEl) {
+            titleEl.textContent = 'Event type not specified';
+          }
+          if (tableBody) {
+            tableBody.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">Add ?type=pull_request or another event to the URL.</td></tr>';
+          }
+          return;
+        }
+
+        if (titleEl) {
+          titleEl.textContent = `Event Type: ${eventParam}`;
+        }
+
+        try {
+          const data = await getEventTypeEvents(eventParam);
+          const events = Array.isArray(data.events) ? data.events : [];
+          let activeFilter = 'all';
+
+          function renderTable() {
+            if (!tableBody) return;
+            tableBody.innerHTML = '';
+            const filtered = activeFilter === 'all'
+              ? events
+              : events.filter((evt) => (evt.action || '').toLowerCase() === activeFilter);
+
+            if (filtered.length === 0) {
+              tableBody.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">No events match this filter.</td></tr>';
+              return;
+            }
+
+            filtered.forEach((event) => {
+              const row = document.createElement('tr');
+              row.className = 'hover:bg-slate-900/80 transition-colors';
+              const statusBadge = event.response_status === 'error'
+                ? '<span class="inline-flex items-center rounded-full bg-rose-500/20 px-2 py-1 text-xs font-semibold text-rose-300">error</span>'
+                : '<span class="inline-flex items-center rounded-full bg-emerald-500/20 px-2 py-1 text-xs font-semibold text-emerald-300">success</span>';
+              row.innerHTML = `
+                <td class="px-4 py-3 font-mono text-xs text-slate-400">
+                  <a href="/detail.html?deliveryId=${encodeURIComponent(event.delivery_id)}" class="hover:text-sky-300">
+                    ${event.delivery_id.slice(0, 8)}…
+                  </a>
+                </td>
+                <td class="px-4 py-3 text-sm">
+                  <a href="/repo.html?name=${encodeURIComponent(event.repo_full_name || '')}" class="text-sky-300 hover:text-sky-200">
+                    ${event.repo_full_name || '—'}
+                  </a>
+                </td>
+                <td class="px-4 py-3 text-sm text-slate-300">${event.action || '—'}</td>
+                <td class="px-4 py-3 text-sm text-slate-300">${event.author_login || '—'}</td>
+                <td class="px-4 py-3 text-sm">${statusBadge}</td>
+                <td class="px-4 py-3 text-sm text-slate-300">${formatTimestamp(event.received_at)}</td>
+              `;
+              tableBody.appendChild(row);
+            });
+          }
+
+          function renderFilters() {
+            if (!filterSection || !filterButtons) return;
+            const uniqueActions = Array.from(new Set(events
+              .map((evt) => (evt.action || '').toLowerCase())
+              .filter((action) => action)));
+            const defaultActions = ['opened', 'closed', 'synchronize', 'ready_for_review', 'converted_to_draft'];
+            const filters = ['all', ...new Set([...defaultActions, ...uniqueActions])];
+
+            filterButtons.innerHTML = '';
+            filters.forEach((action) => {
+              const button = document.createElement('button');
+              button.type = 'button';
+              button.dataset.filter = action;
+              button.className = 'px-3 py-1 text-xs font-semibold rounded-full border transition-colors';
+              const isActive = activeFilter === action;
+              if (isActive) {
+                button.classList.add('border-sky-500/60', 'bg-sky-500/10', 'text-sky-200');
+              } else {
+                button.classList.add('border-slate-700', 'text-slate-300', 'hover:border-sky-500/40', 'hover:text-sky-200');
+              }
+              button.textContent = action === 'all' ? 'All' : action;
+              button.addEventListener('click', () => {
+                activeFilter = action;
+                renderFilters();
+                renderTable();
+              });
+              filterButtons.appendChild(button);
+            });
+
+            filterSection.classList.remove('hidden');
+          }
+
+          if (eventParam === 'pull_request') {
+            renderFilters();
+          }
+
+          renderTable();
+        } catch (error) {
+          if (tableBody) {
+            tableBody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-rose-300">Failed to load event list: ${error.message}</td></tr>`;
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
