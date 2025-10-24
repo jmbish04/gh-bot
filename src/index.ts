@@ -117,12 +117,12 @@ function buildPrBody(actions: Map<string, string>): string {
 }
 
 function safeParseJson<T = unknown>(value: string, fallback: T = [] as unknown as T): T {
-        try {
-                return JSON.parse(value) as T;
-        } catch (error) {
-                console.warn("[MERGE OPS] Failed to parse JSON column", error);
-                return fallback;
-        }
+    try {
+        return JSON.parse(value) as T;
+    } catch (error) {
+        console.warn("[MERGE OPS] Failed to parse JSON column", error);
+        return fallback;
+    }
 }
 
 type TaskAssetCollection = {
