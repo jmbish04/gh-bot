@@ -34,8 +34,8 @@ app.get("/:id", async (c) => {
     }
 
     const finalReport = await c.env.REPO_EVAL_KV.get(`${instanceId}:final`);
-    if (finalReport) {
-        return c.json({ status: "complete", result: finalReport });
+    if (status.status === 'complete' && finalReport) {
+        return c.json({ status, result: { finalReport } });
     }
 
     return c.json({ status });
