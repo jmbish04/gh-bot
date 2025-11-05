@@ -1,0 +1,17 @@
+# GitHub App Configuration
+GITHUB_APP_ID=your_app_id_here
+GITHUB_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nyour_private_key_here\n-----END RSA PRIVATE KEY-----"
+GITHUB_WEBHOOK_SECRET=your_webhook_secret_here
+
+# Cloudflare Configuration
+CF_ACCOUNT_ID=your_cloudflare_account_id
+CF_API_TOKEN=your_cloudflare_api_token
+
+# AI Model Configuration
+SUMMARY_CF_MODEL=@cf/meta/llama-3.1-8b-instruct
+
+# Optional: API Key for dashboard access
+API_KEY=your_optional_api_key_for_dashboard
+
+# Worker URL (for testing)
+WORKER_URL=https://your-worker-name.your-subdomain.workers.dev

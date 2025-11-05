@@ -1,4 +1,3 @@
-// DEPRECATED: replaced by src/github.ts (migrated incrementally).
 import jwt from '@tsndr/cloudflare-worker-jwt'
 
 type Env = {

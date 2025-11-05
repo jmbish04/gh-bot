@@ -19,27 +19,45 @@
 	"durable_objects": {
 		"bindings": [
 			{
-				"name": "RESEARCH_ORCH",
-				"class_name": "ResearchOrchestrator"
+				"name": "RepositoryActor",
+				"class_name": "RepositoryActor"
 			},
 			{
-				"name": "PR_WORKFLOWS",
-				"class_name": "PrWorkflow"
+				"name": "PullRequestActor",
+				"class_name": "PullRequestActor"
 			},
 			{
-				"name": "PROFILE_SCANNER",
-				"class_name": "ProfileScanner"
+				"name": "ResearchActor",
+				"class_name": "ResearchActor"
 			}
 		]
 	},
 	"migrations": [
 		{
-			"tag": "v1",
+			"tag": "v2_actor_refactor",
 			"new_classes": [
+				"RepositoryActor",
+				"PullRequestActor",
+				"ResearchActor"
+			],
+			"deleted_classes": [
 				"ResearchOrchestrator",
 				"PrWorkflow",
-				"ProfileScanner"
+				"ProfileScanner",
+				"RepositorySetupCoordinator"
 			]
+		},
+		{
+			"tag": "add-conflict-resolver",
+			"new_classes": [
+				"ConflictResolver"
+			]
+		}
+	],
+	"services": [
+		{
+			"binding": "Sandbox",
+			"service": "cloudflare-sandbox"
 		}
 	],
 	"d1_databases": [
@@ -54,16 +72,23 @@
 			"binding": "USER_PREFERENCES",
 			"id": "0b559703c0ff499c87dabbeaeac932c5",
 			"preview_id": "7fc6108f01184967aeaf2109da0549de"
+		},
+		{
+			"binding": "REPO_MEMORY",
+			"id": "a25b3ab8cd074bbbadab7fa0637f5e7f",
+			"preview_id": "02bc104a3a1e4111884bbee0a4cd38fb"
 		}
 	],
 	"send_email": [
 		{
-			"binding": "SEB"
+			"name": "SEB",
+			"destination_address": "justin@126colby.com"
 		}
-	].
-    "vars": {
-       "REQUIRED_LABEL": "auto-commit-ok",
-       "SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b",
-       "GITHUB_REPO_DEFAULT_BRANCH_FALLBACK": "main"
-    }
+	],
+	"vars": {
+		"REQUIRED_LABEL": "auto-commit-ok",
+		"SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b",
+		"GITHUB_REPO_DEFAULT_BRANCH_FALLBACK": "main",
+		"CF_BINDINGS_MCP_URL": "https://bindings.mcp.cloudflare.com/mcp"
+	}
 }
