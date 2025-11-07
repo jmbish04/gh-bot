@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Colby GitHub Bot Dashboard</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://unpkg.com/htmx.org@1.9.6"></script>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 Colby GitHub Bot</h1>
+        <p>AI-powered GitHub workflow automation and code analysis</p>
+    </div>
+
+    <div class="nav">
+        <div class="nav-tabs">
+            <a href="#dashboard" class="nav-tab active" onclick="showTab('dashboard', event)">Dashboard</a>
+            <a href="#operations" class="nav-tab" onclick="showTab('operations', event)">Live Operations</a>
+            <a href="#research" class="nav-tab" onclick="showTab('research', event)">Research</a>
+            <a href="#commands" class="nav-tab" onclick="showTab('commands', event)">Command History</a>
+            <a href="#practices" class="nav-tab" onclick="showTab('practices', event)">Best Practices</a>
+            <a href="#repos" class="nav-tab" onclick="showTab('repos', event)">Repository Explorer</a>
+            <a href="#help" class="nav-tab" onclick="showTab('help', event)">Help</a>
+            <a href="/setup" class="nav-tab" target="_blank">⚙️ Setup</a>
+            <a href="https://gh-bot.hacolby.workers.dev/openapi.json" class="nav-tab" target="_blank">OpenAPI Schema</a>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Dashboard Tab -->
+        <div id="dashboard" class="tab-content active">
+            <div class="stats-grid" hx-get="/api/stats" hx-trigger="load" hx-swap="innerHTML">
+                <div class="loading">Loading stats...</div>
+            </div>
+
+            <div class="section">
+                <div class="section-header">Recent Activity</div>
+                <div class="section-content" hx-get="/api/recent-activity" hx-trigger="load" hx-swap="innerHTML">
+                    <div class="loading">Loading recent activity...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Operations Tab -->
+        <div id="operations" class="tab-content">
+            <div class="section">
+                <div class="section-header">Live Operations</div>
+                <div class="section-content" hx-get="/api/operations" hx-trigger="load" hx-swap="innerHTML">
+                    <div class="loading">Loading operations...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Research Tab -->
+        <div id="research" class="tab-content">
+            <div class="section">
+                <div class="section-header">🔬 Research & Analysis</div>
+                <div class="section-content">
+                    <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                        <button onclick="showResearchModal()" class="btn btn-primary">🚀 Run Research Sweep</button>
+                        <button onclick="showResearchStatus()" class="btn btn-secondary">📊 Research Status</button>
+                        <a href="#repos" class="btn btn-secondary" onclick="showTab('repos', event)">📁 View Results</a>
+                    </div>
+                    <p style="color: #586069; font-size: 14px; margin-bottom: 20px;">
+                        Trigger a comprehensive research sweep to discover and analyze Cloudflare Workers repositories. 
+                        This will search GitHub for relevant projects and perform AI-powered analysis.
+                    </p>
+                    
+                    <div class="section">
+                        <div class="section-header">Recent Research Results</div>
+                        <div class="section-content" hx-get="/research/results?limit=10" hx-trigger="load" hx-swap="innerHTML">
+                            <div class="loading">Loading research results...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Commands Tab -->
+        <div id="commands" class="tab-content">
+            <div class="section">
+                <div class="section-header">Command History</div>
+                <div class="section-content" hx-get="/colby/commands?limit=20" hx-trigger="load" hx-swap="innerHTML">
+                    <div class="loading">Loading command history...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Best Practices Tab -->
+        <div id="practices" class="tab-content">
+            <div class="section">
+                <div class="section-header">Bookmarked Best Practices</div>
+                <div class="section-content" hx-get="/colby/best-practices?limit=20" hx-trigger="load" hx-swap="innerHTML">
+                    <div class="loading">Loading best practices...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Repository Explorer Tab -->
+        <div id="repos" class="tab-content">
+            <div class="repo-search">
+                <input type="text" placeholder="Search repositories..." onkeyup="searchRepos(this.value)">
+            </div>
+            <div class="section">
+                <div class="section-header">Analyzed Repositories</div>
+                <div class="section-content" hx-get="/research/results?limit=20" hx-trigger="load" hx-swap="innerHTML">
+                    <div class="loading">Loading repositories...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Help Tab -->
+        <div id="help" class="tab-content">
+            <div class="section">
+                <div class="section-header">🤖 Colby GitHub Bot - Command Reference</div>
+                <div class="section-content">
+                    <p>Colby is an AI-powered GitHub bot that helps with code reviews, issue management, and workflow automation. Use these commands in GitHub PR comments.</p>
+                    
+                    <div class="help-category">
+                        <h2>🚀 Installation & Setup</h2>
+                        <div class="help-command">/colby help</div>
+                        <div class="help-description">Shows this help message with all available commands.</div>
+                    </div>
+
+                    <div class="help-category">
+                        <h2>🔧 Implementation Commands</h2>
+                        <div class="help-command">/colby implement</div>
+                        <div class="help-description">Applies code suggestions from review comments. Analyzes suggestion blocks and creates commits with the proposed changes.</div>
+                        
+                        <div class="help-command">/apply</div>
+                        <div class="help-description">Legacy command - same as /colby implement</div>
+                    </div>
+
+                    <div class="help-category">
+                        <h2>📝 Issue Management</h2>
+                        <div class="help-command">/colby create issue</div>
+                        <div class="help-description">Creates a GitHub issue with AI-generated title and comprehensive description. Analyzes conversation context, code suggestions, and file references to create professional, actionable issues that preserve the full discussion context.</div>
+                        
+                        <div class="help-command">/colby create issue and assign to copilot</div>
+                        <div class="help-description">Creates a new issue with enhanced AI analysis and assigns it to @copilot for automated handling. Includes smart labeling and context preservation.</div>
+                    </div>
+
+                    <div class="help-category">
+                        <h2>📚 Knowledge Management</h2>
+                        <div class="help-command">/colby bookmark this suggestion</div>
+                        <div class="help-description">Saves code suggestions as best practices in the knowledge base. AI automatically categorizes by technology stack and context.</div>
+                        
+                        <div class="help-command">/colby extract suggestions</div>
+                        <div class="help-description">Extracts all suggestions from Gemini/AI code reviews and prepares them for automated implementation via Codex.</div>
+                    </div>
+
+                    <div class="help-category">
+                        <h2>📊 Analysis & Summaries</h2>
+                        <div class="help-command">/summarize</div>
+                        <div class="help-description">Generates an AI-powered summary of the pull request, including changed files and impact analysis.</div>
+                    </div>
+
+                    <div class="help-category">
+                        <h2>🚀 Coming Soon</h2>
+                        <div class="help-command">/fix</div>
+                        <div class="help-description">Automatically fixes common code issues and lint errors.</div>
+                        
+                        <div class="help-command">/lint</div>
+                        <div class="help-description">Runs linting checks and suggests improvements.</div>
+                        
+                        <div class="help-command">/test</div>
+                        <div class="help-description">Generates and runs appropriate tests for code changes.</div>
+                    </div>
+
+                    <div class="help-category">
+                        <h2>💡 Usage Tips</h2>
+                        <div class="help-tips">
+                            <ul>
+                                <li>Commands work in PR comments, review comments, and issue comments</li>
+                                <li>Multiple commands can be used in the same comment</li>
+                                <li>Colby responds with "✅ working on it" for long-running operations</li>
+                                <li>Use <code>```suggestion</code> blocks for code changes</li>
+                                <li>Check the dashboard for operation progress</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Research Modal -->
+    <div id="researchModal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🚀 Run Research Sweep</h3>
+                <span class="close" onclick="closeResearchModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 20px; color: #586069;">
+                    This will trigger a comprehensive research sweep to discover and analyze Cloudflare Workers repositories. 
+                    The process may take several minutes to complete.
+                </p>
+                <div class="form-group">
+                    <label for="frontendPassword">Frontend Password (for security):</label>
+                    <input type="password" id="frontendPassword" placeholder="Enter your frontend password..." style="width: 100%; padding: 8px; border: 1px solid #d1d5da; border-radius: 4px; font-family: monospace;">
+                    <small style="color: #586069; display: block; margin-top: 5px;">
+                        This is the FRONTEND_AUTH_PASSWORD configured in your Cloudflare Worker environment variables.
+                    </small>
+                </div>
+                <div id="researchStatus" style="display: none; margin-top: 15px; padding: 10px; background: #f6f8fa; border-radius: 4px; font-family: monospace; font-size: 12px;"></div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="closeResearchModal()" class="btn btn-secondary">Cancel</button>
+                <button onclick="startResearchSweep()" class="btn btn-primary">Start Research Sweep</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Operation Detail Modal -->
+    <div id="operationDetailModal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Operation Details</h3>
+                <span class="close" onclick="closeOperationDetailModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="operationDetailContent">
+                    <div class="loading">Loading operation details...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="closeOperationDetailModal()" class="btn btn-secondary">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Research Status Modal -->
+    <div id="researchStatusModal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🔬 Research Status</h3>
+                <span class="close" onclick="closeResearchStatusModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="researchStatusContent">
+                    <div class="loading">Loading research status...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="closeResearchStatusModal()" class="btn btn-secondary">Close</button>
+                <button onclick="refreshResearchStatus()" class="btn btn-primary">🔄 Refresh</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Repository Analysis Modal -->
+    <div id="repoAnalysisModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 800px; max-height: 90vh; overflow-y: auto;">
+            <div class="modal-header">
+                <h3 id="repoModalTitle">Repository Analysis</h3>
+                <span class="close" onclick="closeRepoModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="repoAnalysisContent">
+                    <div class="loading">Loading repository analysis...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                    <div>
+                        <button id="thumbsUp" onclick="recordFeedback('like')" class="btn btn-success" style="margin-right: 10px;">👍 Like</button>
+                        <button id="thumbsDown" onclick="recordFeedback('dislike')" class="btn btn-danger">👎 Dislike</button>
+                    </div>
+                    <button onclick="closeRepoModal()" class="btn btn-secondary">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>

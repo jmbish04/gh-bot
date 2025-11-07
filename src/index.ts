@@ -103,9 +103,70 @@ app.options('*', () =>
   })
 )
 
-app.get('/health', (c) => c.json({ ok: true }))
+app.get('/health', async (c) => {
+  const { getLatestTestResult } = await import('./modules/test_runner')
+  const latestTest = await getLatestTestResult(c.env)
+  
+  if (!latestTest) {
+    return c.json({ 
+      ok: true, 
+      status: 'healthy',
+      message: 'No test results available yet',
+      timestamp: new Date().toISOString()
+    })
+  }
 
-app.get('/api/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }))
+  const isHealthy = latestTest.status === 'passed' && latestTest.failedTests === 0
+  const healthStatus = isHealthy ? 'healthy' : latestTest.status === 'failed' ? 'degraded' : 'unhealthy'
+
+  return c.json({
+    ok: isHealthy,
+    status: healthStatus,
+    testResults: {
+      suite: latestTest.testSuite,
+      totalTests: latestTest.totalTests,
+      passedTests: latestTest.passedTests,
+      failedTests: latestTest.failedTests,
+      skippedTests: latestTest.skippedTests,
+      durationMs: latestTest.durationMs,
+      status: latestTest.status,
+      triggeredBy: latestTest.triggeredBy,
+      createdAt: latestTest.testDetails ? new Date().toISOString() : undefined,
+    },
+    timestamp: new Date().toISOString()
+  })
+})
+
+app.get('/api/health', async (c) => {
+  const { getLatestTestResult } = await import('./modules/test_runner')
+  const latestTest = await getLatestTestResult(c.env)
+  
+  if (!latestTest) {
+    return c.json({ 
+      status: 'healthy', 
+      message: 'No test results available yet',
+      timestamp: new Date().toISOString() 
+    })
+  }
+
+  const isHealthy = latestTest.status === 'passed' && latestTest.failedTests === 0
+  const healthStatus = isHealthy ? 'healthy' : latestTest.status === 'failed' ? 'degraded' : 'unhealthy'
+
+  return c.json({ 
+    status: healthStatus,
+    testResults: {
+      suite: latestTest.testSuite,
+      totalTests: latestTest.totalTests,
+      passedTests: latestTest.passedTests,
+      failedTests: latestTest.failedTests,
+      skippedTests: latestTest.skippedTests,
+      durationMs: latestTest.durationMs,
+      status: latestTest.status,
+      triggeredBy: latestTest.triggeredBy,
+    },
+    timestamp: new Date().toISOString() 
+  })
+})
 
 app.get('/api/status', async (c) => {
   const stats = await fetchStats(c.env)
@@ -137,7 +198,7 @@ app.get('/api/research/status', async (c) => {
           progress: 0,
           current_operation: `${res.status} ${res.statusText}`
         },
-        res.status
+        res.status as 500
       )
     }
 
@@ -191,11 +252,111 @@ app.post('/github/webhook', async (c) => {
   )
 })
 
+app.post('/tests/run', async (c) => {
+  try {
+    const { runWebhookTests, saveTestResults } = await import('./modules/test_runner')
+    const triggeredBy = (c.req.query('trigger') as 'cron' | 'manual' | 'api') || 'manual'
+    
+    console.log(`[TESTS] Running test suite (triggered by: ${triggeredBy})`)
+    const result = await runWebhookTests(c.env)
+    result.triggeredBy = triggeredBy
+    
+    const testId = await saveTestResults(c.env, result)
+    
+    return c.json({
+      success: true,
+      testId,
+      result: {
+        suite: result.testSuite,
+        totalTests: result.totalTests,
+        passedTests: result.passedTests,
+        failedTests: result.failedTests,
+        skippedTests: result.skippedTests,
+        durationMs: result.durationMs,
+        status: result.status,
+        triggeredBy: result.triggeredBy,
+      },
+      timestamp: new Date().toISOString()
+    })
+  } catch (error) {
+    console.error('[TESTS] Failed to run tests:', error)
+    return c.json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      timestamp: new Date().toISOString()
+    }, 500)
+  }
+})
+
+app.get('/tests/results', async (c) => {
+  try {
+    const limit = Number.parseInt(c.req.query('limit') || '10', 10)
+    const { results } = await c.env.DB.prepare(
+      `SELECT 
+        id, test_suite, total_tests, passed_tests, failed_tests, skipped_tests,
+        duration_ms, status, error_message, triggered_by, created_at
+      FROM test_results
+      ORDER BY created_at DESC
+      LIMIT ?`
+    ).bind(limit).all<{
+      id: number
+      test_suite: string
+      total_tests: number
+      passed_tests: number
+      failed_tests: number
+      skipped_tests: number
+      duration_ms: number
+      status: string
+      error_message: string | null
+      triggered_by: string
+      created_at: string
+    }>()
+
+    return c.json({
+      results: (results || []).map((row) => ({
+        id: row.id,
+        suite: row.test_suite,
+        totalTests: row.total_tests,
+        passedTests: row.passed_tests,
+        failedTests: row.failed_tests,
+        skippedTests: row.skipped_tests,
+        durationMs: row.duration_ms,
+        status: row.status,
+        errorMessage: row.error_message,
+        triggeredBy: row.triggered_by,
+        createdAt: row.created_at,
+      })),
+      count: results?.length || 0
+    })
+  } catch (error) {
+    console.error('[TESTS] Failed to get test results:', error)
+    return c.json({
+      error: error instanceof Error ? error.message : String(error)
+    }, 500)
+  }
+})
+
 app.notFound((c) => c.json({ error: 'Not Found' }, 404))
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return app.fetch(request, env, ctx)
+  },
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Handle cron triggers
+    if (event.cron === '0 2 * * *') {
+      // Daily at 2 AM - run tests
+      console.log('[CRON] Running daily test suite')
+      try {
+        const { runWebhookTests, saveTestResults } = await import('./modules/test_runner')
+        const result = await runWebhookTests(env)
+        result.triggeredBy = 'cron'
+        await saveTestResults(env, result)
+        console.log(`[CRON] Test suite completed: ${result.status} (${result.passedTests}/${result.totalTests} passed)`)
+      } catch (error) {
+        console.error('[CRON] Failed to run test suite:', error)
+      }
+    }
   }
 }
 
@@ -643,3 +804,4 @@ function groupWebhookEvents(rows: WebhookEventRow[]): TaskGroup[] {
 export { RepositoryActor } from './actors/RepositoryActor'
 export { PullRequestActor } from './actors/PullRequestActor'
 export { ResearchActor } from './actors/ResearchActor'
+export { ConflictResolver } from './do_conflict_resolver'

@@ -14,6 +14,9 @@ import type { MergeConflictTrigger } from '../types/merge_conflicts'
 
 export const CONFLICT_MENTION_PATTERN = /(?:@colby|colby)[,:]?\s+(?:please\s+)?fix(?:\s+(?:the\s+)?code)?\s+conflicts?/i
 
+export type { Env }
+export type { WebhookData }
+
 /**
  * Helper function to handle MCP tools setup for any repository event
  */
@@ -62,7 +65,7 @@ type WebhookData = {
 
 const MAX_CONTEXT_TEXT_LENGTH = 4000
 
-function truncateText(value: unknown, limit: number = MAX_CONTEXT_TEXT_LENGTH): string | undefined {
+export function truncateText(value: unknown, limit: number = MAX_CONTEXT_TEXT_LENGTH): string | undefined {
   if (typeof value !== 'string') {
     return typeof value === 'number' || typeof value === 'boolean' ? String(value) : undefined
   }
@@ -74,7 +77,7 @@ function truncateText(value: unknown, limit: number = MAX_CONTEXT_TEXT_LENGTH): 
   return value.slice(0, limit) + '…'
 }
 
-function simplifyUser(user: any) {
+export function simplifyUser(user: any) {
   if (!user) return undefined
   return {
     login: user.login,
@@ -85,7 +88,7 @@ function simplifyUser(user: any) {
   }
 }
 
-function simplifyRepository(repo: any) {
+export function simplifyRepository(repo: any) {
   if (!repo) return undefined
   return {
     id: repo.id,
@@ -98,7 +101,7 @@ function simplifyRepository(repo: any) {
   }
 }
 
-function extractRelevantData(eventType: string, payload: any) {
+export function extractRelevantData(eventType: string, payload: any) {
   const relevant: Record<string, any> = {
     event_type: eventType,
     action: payload?.action,
@@ -278,7 +281,7 @@ function extractRelevantData(eventType: string, payload: any) {
 /**
  * Checks if a duplicate delivery should be allowed to reprocess
  */
-async function checkRecentDuplicate(env: Env, delivery: string, isCommentEvent: boolean): Promise<boolean> {
+export async function checkRecentDuplicate(env: Env, delivery: string, isCommentEvent: boolean): Promise<boolean> {
   try {
     // For comment events, allow reprocessing if it's been more than 5 minutes
     // For other events, be more strict (30 minutes)
@@ -317,7 +320,7 @@ async function checkRecentDuplicate(env: Env, delivery: string, isCommentEvent: 
 /**
  * Checks if a repository is new (not in the projects table)
  */
-async function isNewRepository(env: Env, repo: string): Promise<boolean> {
+export async function isNewRepository(env: Env, repo: string): Promise<boolean> {
   try {
     const result = await env.DB.prepare(
       'SELECT 1 FROM projects WHERE repo = ? LIMIT 1'
@@ -496,7 +499,7 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
   const receivedAt = new Date(startTime).toISOString()
   let webhookEventId: number | null = null
 
-  // Idempotency: check if we've seen this delivery recently
+  // Idempotency: skip if we've seen this delivery already
   console.log('[WEBHOOK] Checking for duplicate delivery:', delivery)
   try {
     // First, try to insert the event with normalized metadata
@@ -689,18 +692,12 @@ export async function handleWebhook(webhookData: WebhookData, env: Env) {
     } else if (event === 'pull_request_review') {
       console.log('[WEBHOOK] Handling pull_request_review')
       response = await onPRReview(env, delivery, payload, startTime)
-    } else if (event === 'issues' && payload.action === 'opened') {
-      console.log('[WEBHOOK] Handling issues event')
-      response = await onIssueOpened(env, delivery, payload, startTime)
     } else if (event === 'issue_comment' && payload.issue?.pull_request) {
       console.log('[WEBHOOK] Handling issue_comment on PR')
       response = await onIssueComment(env, delivery, payload, startTime)
     } else if (event === 'pull_request') {
       console.log('[WEBHOOK] Handling pull_request event')
       response = await onPullRequest(env, delivery, payload, startTime)
-    } else if (event === 'repository' && payload.action === 'created') {
-      console.log('[WEBHOOK] Handling repository creation')
-      response = await onRepositoryCreated(env, delivery, payload, startTime)
     } else {
       console.log('[WEBHOOK] Event type not handled, ignoring:', event)
       response = new Response('ignored', { status: 200 })
@@ -765,37 +762,8 @@ async function onReviewComment(env: Env, delivery: string, p: any, startTime: nu
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
 
-  // Check and setup MCP tools for the repository
-  await handleMcpToolsForRepo(env.DB, repo, 'pull_request_review_comment')
-
-  // Check if this is a new repository and trigger research sweep
-  const isNew = await isNewRepository(env, repo)
-  if (isNew) {
-    console.log('[WEBHOOK] New repository detected in review comment, triggering research sweep:', repo)
-    // Trigger research sweep asynchronously (don't wait for it)
-    triggerResearchSweep(env, repo).catch(error => {
-      console.error('[WEBHOOK] Failed to trigger research sweep for new repository:', repo, error)
-    })
-  }
-
   const body: string = p.comment.body || ''
-  let suggestions = extractSuggestions(body)
-  
-  // If no suggestions in comment body but we have a diff_hunk, extract from diff_hunk
-  if (suggestions.length === 0 && p.comment.diff_hunk) {
-    console.log('[WEBHOOK] No suggestions in comment body, extracting from diff_hunk')
-    const addedLines = p.comment.diff_hunk
-      .split('\n')
-      .filter((line: string) => line.startsWith('+') && !line.startsWith('+++'))
-      .map((line: string) => line.substring(1)) // Remove the + prefix
-      .filter((line: string) => line.trim().length > 0)
-
-    if (addedLines.length > 0) {
-      suggestions = [addedLines.join('\n')]
-      console.log(`[WEBHOOK] Extracted fallback suggestion block from diff_hunk with ${addedLines.length} line(s)`)
-    }
-  }
-  
+  const suggestions = extractSuggestions(body)
   const triggers = parseTriggers(body)
 
   console.log('[WEBHOOK] Review comment processing details:', {
@@ -880,9 +848,6 @@ async function onPRReview(env: Env, delivery: string, p: any, startTime: number)
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
 
-  // Check and setup MCP tools for the repository
-  await handleMcpToolsForRepo(env.DB, repo, 'pull_request_review')
-
   const body: string = p.review.body || ''
   const suggestions = extractSuggestions(body)
   const triggers = parseTriggers(body)
@@ -913,74 +878,6 @@ async function onPRReview(env: Env, delivery: string, p: any, startTime: number)
 }
 
 /**
- * Processes an issues opened event.
- * Extracts triggers from the issue body and forwards the event to a Durable Object.
- *
- * @param env - The environment bindings, including database and Durable Object namespace.
- * @param delivery - The unique delivery ID of the webhook event.
- * @param p - The parsed payload of the webhook event.
- * @param startTime - The start time for processing tracking.
- * @returns A Response object indicating the result of the processing.
- */
-async function onIssueOpened(env: Env, delivery: string, p: any, startTime: number) {
-  const repo = `${p.repository.owner.login}/${p.repository.name}`
-  const issueNumber = p.issue.number
-  const author = p.issue.user.login
-  const action = p.action
-  if (p.issue.user.type === 'Bot') return new Response('bot ignored', { status: 200 })
-
-  await updateEventMeta(env, delivery, repo, null, author, action)
-
-  // Check and setup MCP tools for the repository
-  await handleMcpToolsForRepo(env.DB, repo, 'issues')
-
-  const body: string = p.issue.body || ''
-  const suggestions = extractSuggestions(body)
-  const triggers = parseTriggers(body)
-
-  console.log('[WEBHOOK] Issue opened processing details:', {
-    repo,
-    issueNumber,
-    author,
-    action,
-    hasBody: !!body,
-    bodyLength: body.length,
-    bodyPreview: body.substring(0, 100),
-    suggestionsCount: suggestions.length,
-    triggersCount: triggers.length,
-    triggers: triggers,
-    installationId: p.installation?.id
-  })
-
-  // Don't exit early - let the DO decide what to do
-  const doId = env.PR_WORKFLOWS.idFromName(`${repo}#${issueNumber}`)
-  const stub = env.PR_WORKFLOWS.get(doId)
-
-  const res = await stub.fetch('https://do/event', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      kind: 'issue_opened',
-      delivery,
-      repo,
-      prNumber: null, // No PR number for issues
-      issueNumber,
-      headRef: p.repository.default_branch,
-      headSha: null, // Issues don't have headSha like PRs
-      installationId: p.installation?.id,
-      author,
-      action,
-      suggestions,
-      triggers,
-      // For issues, we don't have a specific commentId
-      commentId: null
-    })
-  })
-  // Don't consume response body to avoid "Body has already been used" error
-  return new Response('issue-opened-processed', { status: res.status })
-}
-
-/**
  * Processes an issue comment event on a pull request.
  * Extracts triggers from the comment body and forwards the event to a Durable Object.
  *
@@ -995,24 +892,9 @@ async function onIssueComment(env: Env, delivery: string, p: any, startTime: num
   const prNumber = p.issue.number
   const author = p.comment.user.login
   const action = p.action
-  
-  console.log('[WEBHOOK] onIssueComment called:', {
-    repo,
-    prNumber,
-    author,
-    action,
-    commentId: p.comment.id,
-    isBot: p.comment.user.type === 'Bot',
-    hasPullRequest: !!p.issue.pull_request,
-    bodyPreview: p.comment.body?.substring(0, 100)
-  })
-  
   if (p.comment.user.type === 'Bot') return new Response('bot ignored', { status: 200 })
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
-
-  // Check and setup MCP tools for the repository  
-  await handleMcpToolsForRepo(env.DB, repo, 'issue_comment')
 
   const body: string = p.comment.body || ''
   const triggers = parseTriggers(body)
@@ -1196,19 +1078,6 @@ async function onPullRequest(env: Env, delivery: string, p: any, startTime: numb
   const action = p.action
 
   await updateEventMeta(env, delivery, repo, prNumber, author, action)
-
-  // Check and setup MCP tools for the repository
-  await handleMcpToolsForRepo(env.DB, repo, 'pull_request')
-
-  // Check if this is a new repository and trigger research sweep
-  const isNew = await isNewRepository(env, repo)
-  if (isNew) {
-    console.log('[WEBHOOK] New repository detected in PR event, triggering research sweep:', repo)
-    // Trigger research sweep asynchronously (don't wait for it)
-    triggerResearchSweep(env, repo).catch(error => {
-      console.error('[WEBHOOK] Failed to trigger research sweep for new repository:', repo, error)
-    })
-  }
 
   const interesting = new Set([
     'opened', 'reopened', 'ready_for_review', 'synchronize', 'labeled', 'unlabeled', 'closed'
@@ -1522,101 +1391,11 @@ async function updateEventMeta(
  * @param text - The text body containing potential code suggestions.
  * @returns An array of code suggestions extracted from the text.
  */
-function extractSuggestions(text: string): string[] {
+export function extractSuggestions(text: string): string[] {
   const out: string[] = []
-  
-  // Pattern 1: Standard ```suggestion blocks
-  const suggestionRe = /```suggestion\s*\n([\s\S]*?)```/g
-  let m: RegExpExecArray | null
-  while ((m = suggestionRe.exec(text)) !== null) {
-    out.push(m[1])
-  }
-  
-  // Pattern 2: Gemini CLI format - ```typescript or ```javascript blocks with suggestions
-  const codeBlockRe = /```(?:typescript|javascript|ts|js|python|py|java|cpp|c|go|rust|php|ruby|swift|kotlin|scala|r|sql|html|css|json|yaml|xml|markdown|md|bash|sh|powershell|ps1|dockerfile|docker|yaml|yml|toml|ini|conf|config|txt|text|plain|diff|patch)\s*\n([\s\S]*?)```/g
-  while ((m = codeBlockRe.exec(text)) !== null) {
-    const code = m[1].trim()
-    // Only include if it looks like a suggestion (not just a code example)
-    if (code.length > 10 && !code.includes('// Example') && !code.includes('// Sample')) {
-      out.push(code)
-    }
-  }
-  
-  // Pattern 3: Lines starting with + (diff-style suggestions)
-  const diffRe = /^\+.*$/gm
-  const diffMatches = text.match(diffRe)
-  if (diffMatches && diffMatches.length > 0) {
-    const diffSuggestion = diffMatches.map(line => line.substring(1)).join('\n')
-    if (diffSuggestion.trim().length > 0) {
-      out.push(diffSuggestion.trim())
-    }
-  }
-  
-  // Pattern 4: AI Code Assist suggestions (specific format from Gemini/Codex)
-  // Look for code blocks that are clearly suggestions, not just examples
-  const aiSuggestionRe = /```(?:typescript|javascript|ts|js|python|py|java|cpp|c|go|rust|php|ruby|swift|kotlin|scala|r|sql|html|css|json|yaml|xml|markdown|md|bash|sh|powershell|ps1|dockerfile|docker|yaml|yml|toml|ini|conf|config|txt|text|plain|diff|patch)\s*\n([\s\S]*?)```/g
-  let aiMatch: RegExpExecArray | null
-  while ((aiMatch = aiSuggestionRe.exec(text)) !== null) {
-    const code = aiMatch[1].trim()
-    // More aggressive detection for AI suggestions
-    if (code.length > 5 && 
-        (code.includes('function') || code.includes('const') || code.includes('let') || code.includes('var') || 
-         code.includes('class') || code.includes('interface') || code.includes('type') || 
-         code.includes('import') || code.includes('export') || code.includes('return') ||
-         code.includes('if') || code.includes('for') || code.includes('while') ||
-         code.includes('{') || code.includes('}') || code.includes('(') || code.includes(')') ||
-         code.includes('=') || code.includes('=>') || code.includes(';'))) {
-      out.push(code)
-    }
-  }
-  
-  // Pattern 5: Inline code suggestions (backticks with code)
-  const inlineCodeRe = /`([^`\n]{10,})`/g
-  while ((m = inlineCodeRe.exec(text)) !== null) {
-    const code = m[1].trim()
-    if (code.length > 10 && 
-        (code.includes('function') || code.includes('const') || code.includes('let') || code.includes('var') || 
-         code.includes('class') || code.includes('interface') || code.includes('type') || 
-         code.includes('import') || code.includes('export') || code.includes('return') ||
-         code.includes('if') || code.includes('for') || code.includes('while') ||
-         code.includes('{') || code.includes('}') || code.includes('(') || code.includes(')') ||
-         code.includes('=') || code.includes('=>') || code.includes(';'))) {
-      out.push(code)
-    }
-  }
-  
-  // Pattern 6: Lines that look like code suggestions (indented or with specific keywords)
-  const suggestionKeywords = ['suggest', 'recommend', 'propose', 'improve', 'fix', 'update', 'change', 'modify', 'should', 'could', 'would']
-  const lines = text.split('\n')
-  let currentSuggestion = ''
-  let inSuggestion = false
-  
-  for (const line of lines) {
-    const lowerLine = line.toLowerCase()
-    if (suggestionKeywords.some(keyword => lowerLine.includes(keyword)) && 
-        (line.includes('```') || line.trim().startsWith('function') || line.trim().startsWith('const') || line.trim().startsWith('let') || line.trim().startsWith('var'))) {
-      inSuggestion = true
-      currentSuggestion = line
-    } else if (inSuggestion && (line.trim() === '' || line.startsWith(' ') || line.startsWith('\t') || line.includes('```'))) {
-      if (line.includes('```')) {
-        inSuggestion = false
-        if (currentSuggestion.trim().length > 0) {
-          out.push(currentSuggestion.trim())
-          currentSuggestion = ''
-        }
-      } else {
-        currentSuggestion += '\n' + line
-      }
-    } else if (inSuggestion && line.trim() !== '') {
-      currentSuggestion += '\n' + line
-    }
-  }
-  
-  // Add any remaining suggestion
-  if (currentSuggestion.trim().length > 0) {
-    out.push(currentSuggestion.trim())
-  }
-  
+  const re = /```suggestion\s*\n([\s\S]*?)```/g
+  let m
+  while ((m = re.exec(text)) !== null) out.push(m[1])
   return out
 }
 
@@ -1626,7 +1405,7 @@ function extractSuggestions(text: string): string[] {
  * @param text - The text body containing potential trigger commands.
  * @returns An array of trigger commands extracted from the text.
  */
-function parseTriggers(text: string): string[] {
+export function parseTriggers(text: string): string[] {
   const out: string[] = []
 
   // Original commands
@@ -1635,7 +1414,7 @@ function parseTriggers(text: string): string[] {
   while ((m = originalRe.exec(text)) !== null) out.push(m[0].trim())
 
   // Colby commands
-  const colbyRe = /^\s*\/colby\s+(implement|create\s+issue(?:\s+and\s+assign\s+to\s+copilot)?|bookmark\s+this\s+suggestion|extract\s+suggestions(?:\s+to\s+issues?)?|help|configure\s+agent|provide\s+\w+\s+guidance|provide\s+guidance|llm-full|resolve\s+conflicts?|clear\s+conflicts?|create\s+llms?\s+docs?|fetch\s+llms?\s+docs?|optimize\s+worker|setup\s+worker)\b.*$/gmi
+  const colbyRe = /^\s*\/colby\s+(implement|create\s+issue(?:\s+and\s+assign\s+to\s+copilot)?|bookmark\s+this\s+suggestion|extract\s+suggestions|help|configure\s+agent|provide\s+\w+\s+guidance|provide\s+guidance|llm-full)\b.*$/gmi
   while ((m = colbyRe.exec(text)) !== null) out.push(m[0].trim())
 
   return out
