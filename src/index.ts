@@ -198,7 +198,7 @@ app.get('/api/research/status', async (c) => {
           progress: 0,
           current_operation: `${res.status} ${res.statusText}`
         },
-        res.status
+        res.status as 500
       )
     }
 
@@ -804,3 +804,4 @@ function groupWebhookEvents(rows: WebhookEventRow[]): TaskGroup[] {
 export { RepositoryActor } from './actors/RepositoryActor'
 export { PullRequestActor } from './actors/PullRequestActor'
 export { ResearchActor } from './actors/ResearchActor'
+export { ConflictResolver } from './do_conflict_resolver'
