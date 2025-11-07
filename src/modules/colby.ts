@@ -1,6 +1,7 @@
 // src/modules/colby.ts
-import { ghREST } from './github_helpers'
+import { ghREST } from '../github'
 import { broadcastCommandStatus } from './command_status_ws'
+import { OperationLogger } from './operation_logger'
 
 type Env = {
   DB: D1Database
@@ -49,6 +50,15 @@ export async function createColbyCommand(env: Env, cmd: Omit<ColbyCommand, 'id'>
     ).run()
 
     const commandId = result.meta?.last_row_id as number
+    const operationId = cmd.deliveryId
+    const logger = new OperationLogger({ DB: env.DB }, operationId)
+    await logger.info('Command queued', {
+      commandId,
+      repo: cmd.repo,
+      prNumber: cmd.prNumber,
+      author: cmd.author,
+      command: cmd.command
+    })
     broadcastCommandStatus({
       commandId: String(commandId),
       status: cmd.status,
@@ -63,6 +73,15 @@ export async function createColbyCommand(env: Env, cmd: Omit<ColbyCommand, 'id'>
     console.log('Failed to create colby command (table may not exist):', error)
     // Return a dummy ID to allow the flow to continue
     const fallbackId = Date.now()
+    const operationId = cmd.deliveryId
+    const logger = new OperationLogger({ DB: env.DB }, operationId)
+    await logger.warn('Command queued using fallback identifier', {
+      repo: cmd.repo,
+      prNumber: cmd.prNumber,
+      author: cmd.author,
+      command: cmd.command,
+      error: error instanceof Error ? error.message : String(error)
+    })
     broadcastCommandStatus({
       commandId: String(fallbackId),
       status: cmd.status,
@@ -79,6 +98,24 @@ export async function createColbyCommand(env: Env, cmd: Omit<ColbyCommand, 'id'>
  * Updates a colby command status and result
  */
 export async function updateColbyCommand(env: Env, id: number, updates: Partial<ColbyCommand>): Promise<void> {
+  let operationLogger: OperationLogger | null = null
+  let operationContext: { delivery_id?: string; repo?: string; pr_number?: number; command?: string } = {}
+
+  try {
+    const existing = await env.DB.prepare(
+      'SELECT delivery_id, repo, pr_number, command FROM colby_commands WHERE id = ?'
+    )
+      .bind(id)
+      .first()
+
+    if (existing && existing.delivery_id) {
+      operationContext = existing as typeof operationContext
+      operationLogger = new OperationLogger({ DB: env.DB }, String(existing.delivery_id))
+    }
+  } catch (lookupError) {
+    console.log('Failed to load command metadata for logging:', lookupError)
+  }
+
   try {
     const fields: string[] = []
     const values: (string | number | null)[] = []
@@ -108,10 +145,65 @@ export async function updateColbyCommand(env: Env, id: number, updates: Partial<
       values.push(id)
       await env.DB.prepare(`
         UPDATE colby_commands SET ${fields.join(', ')} WHERE id = ?
-      `).bind(...values).run()
+      `)
+        .bind(...values)
+        .run()
+    }
+
+    if (operationLogger) {
+      const details: Record<string, unknown> = {
+        commandId: id,
+        repo: operationContext.repo,
+        prNumber: operationContext.pr_number,
+        command: operationContext.command
+      }
+
+      if (updates.status) {
+        details.status = updates.status
+      }
+      if (updates.promptGenerated) {
+        details.promptGenerated = updates.promptGenerated
+      }
+      if (updates.resultData && typeof updates.resultData === 'object') {
+        const resultSummary: Record<string, unknown> = {}
+        const message = (updates.resultData as Record<string, unknown>).message
+        const progress = (updates.resultData as Record<string, unknown>).progress
+        if (typeof message === 'string') {
+          resultSummary.message = message
+        }
+        if (typeof progress === 'number') {
+          resultSummary.progress = progress
+        }
+        if (Object.keys(resultSummary).length > 0) {
+          details.resultData = resultSummary
+        }
+      }
+      if (updates.errorMessage) {
+        details.errorMessage = updates.errorMessage
+      }
+
+      if (updates.status === 'failed') {
+        await operationLogger.error('Command failed', details)
+      } else if (updates.status === 'completed') {
+        await operationLogger.info('Command completed', details)
+      } else if (updates.status === 'working') {
+        await operationLogger.info('Command in progress', details)
+      } else if (updates.status) {
+        await operationLogger.info('Command status updated', details)
+      } else if (updates.errorMessage) {
+        await operationLogger.error('Command reported an error', details)
+      } else {
+        await operationLogger.debug('Command metadata updated', details)
+      }
     }
   } catch (error) {
     console.log('Failed to update colby command (table may not exist):', error)
+    if (operationLogger) {
+      await operationLogger.error('Command update failed', {
+        commandId: id,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
   }
 
   const resultData = updates.resultData

@@ -54,12 +54,15 @@
 			]
 		}
 	],
-	"services": [
-		{
-			"binding": "Sandbox",
-			"service": "cloudflare-sandbox"
-		}
-	],
+	/**
+	 * Coming soon via https://github.com/jmbish04/sandbox-worker-container
+	 **/
+	// "services": [
+	//   {
+	//     "binding": "Sandbox",
+	//     "service": "repo-agent-worker"
+	//   }
+	// ],
 	"d1_databases": [
 		{
 			"binding": "DB",
@@ -85,6 +88,11 @@
 			"destination_address": "justin@126colby.com"
 		}
 	],
+	"triggers": {
+		"crons": [
+			"0 2 * * *"
+		]
+	},
 	"vars": {
 		"REQUIRED_LABEL": "auto-commit-ok",
 		"SUMMARY_CF_MODEL": "@cf/openai/gpt-oss-120b",

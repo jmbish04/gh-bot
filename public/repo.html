@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Repository View · gh-bot Monitoring</title>
+    <script src="https://cdn.tailwindcss.com" defer></script>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.5.2/flowbite.min.css"
+      integrity="sha512-ls4PRpkTcVxpKa+wVU+p+PM7HLszVd00ENIm0rtvpD4K1JkPFAtFzI43fJqlZLKF+Fku0X7m0h9a4i6Yeg+ANw=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+    <script src="/nav.js" defer></script>
+    <script src="/server.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.5.2/flowbite.min.js" defer></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 min-h-screen">
+    <nav id="site-nav"></nav>
+    <main class="max-w-6xl mx-auto px-4 py-10 space-y-8">
+      <header>
+        <p class="text-sm text-slate-400">Repository</p>
+        <h1 id="repo-title" class="text-3xl font-semibold text-white">Loading…</h1>
+      </header>
+      <section>
+        <div class="overflow-hidden rounded-xl border border-slate-800 bg-slate-900/60 shadow-xl shadow-slate-950/40">
+          <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-slate-800">
+              <thead class="bg-slate-900/80">
+                <tr>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Delivery</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Event</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Action</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Author</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Status</th>
+                  <th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-widest text-slate-400">Received</th>
+                </tr>
+              </thead>
+              <tbody id="repo-events-table" class="divide-y divide-slate-800/60">
+                <tr>
+                  <td colspan="6" class="px-4 py-8 text-center text-sm text-slate-400">Loading repository activity…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script>
+      document.addEventListener('DOMContentLoaded', async () => {
+        const params = new URLSearchParams(window.location.search);
+        const repoParam = params.get('name');
+        const titleEl = document.getElementById('repo-title');
+        const tableBody = document.getElementById('repo-events-table');
+        const { getRepoEvents, formatTimestamp } = window.dashboardApi || {};
+
+        if (!repoParam || !getRepoEvents) {
+          if (titleEl) {
+            titleEl.textContent = 'Repository not specified';
+          }
+          if (tableBody) {
+            tableBody.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">Add ?name=owner/repo to the URL to load data.</td></tr>';
+          }
+          return;
+        }
+
+        if (titleEl) {
+          titleEl.textContent = repoParam;
+        }
+
+        try {
+          const [owner, repoName] = repoParam.split('/');
+          const data = await getRepoEvents(owner, repoName);
+          const events = Array.isArray(data.events) ? data.events : [];
+          if (tableBody) {
+            tableBody.innerHTML = '';
+            if (events.length === 0) {
+              tableBody.innerHTML = '<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-slate-500">No webhook deliveries found for this repository.</td></tr>';
+            } else {
+              events.forEach((event) => {
+                const row = document.createElement('tr');
+                row.className = 'hover:bg-slate-900/80 transition-colors';
+                const statusBadge = event.response_status === 'error'
+                  ? '<span class="inline-flex items-center rounded-full bg-rose-500/20 px-2 py-1 text-xs font-semibold text-rose-300">error</span>'
+                  : '<span class="inline-flex items-center rounded-full bg-emerald-500/20 px-2 py-1 text-xs font-semibold text-emerald-300">success</span>';
+                row.innerHTML = `
+                  <td class="px-4 py-3 font-mono text-xs text-slate-400">
+                    <a href="/detail.html?deliveryId=${encodeURIComponent(event.delivery_id)}" class="hover:text-sky-300">
+                      ${event.delivery_id.slice(0, 8)}…
+                    </a>
+                  </td>
+                  <td class="px-4 py-3 text-sm text-white">${event.event_type}</td>
+                  <td class="px-4 py-3 text-sm text-slate-300">${event.action || '—'}</td>
+                  <td class="px-4 py-3 text-sm text-slate-300">${event.author_login || '—'}</td>
+                  <td class="px-4 py-3 text-sm">${statusBadge}</td>
+                  <td class="px-4 py-3 text-sm text-slate-300">${formatTimestamp(event.received_at)}</td>
+                `;
+                tableBody.appendChild(row);
+              });
+            }
+          }
+        } catch (error) {
+          if (tableBody) {
+            tableBody.innerHTML = `<tr><td colspan="6" class="px-4 py-8 text-center text-sm text-rose-300">Failed to load repository events: ${error.message}</td></tr>`;
+          }
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -1,4 +1,4 @@
-import { getFileAtRef } from './github_helpers'
+import { getFileAtRef } from '../github'
 
 type BuildArgs = {
   token: string

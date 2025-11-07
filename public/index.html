@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GH Bot Task Dashboard</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0f172a;
+        --panel: rgba(15, 23, 42, 0.75);
+        --panel-light: rgba(148, 163, 184, 0.12);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --accent-soft: rgba(56, 189, 248, 0.25);
+        --success: #4ade80;
+        --border: rgba(148, 163, 184, 0.25);
+        font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: linear-gradient(160deg, #020617 0%, #0f172a 45%, #1e293b 100%);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      header {
+        padding: 24px clamp(16px, 6vw, 64px);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      header h1 {
+        font-size: clamp(1.5rem, 2.6vw, 2.4rem);
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+
+      header p {
+        color: var(--muted);
+        margin: 0;
+        font-size: clamp(0.9rem, 1.5vw, 1.05rem);
+      }
+
+      main {
+        padding: 0 clamp(16px, 6vw, 64px) 48px;
+        flex: 1 1 auto;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: clamp(16px, 2vw, 28px);
+        box-shadow: 0 18px 45px rgba(2, 6, 23, 0.45);
+        backdrop-filter: blur(18px);
+      }
+
+      .section-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      .section-header h2 {
+        font-size: clamp(1.2rem, 2vw, 1.6rem);
+        font-weight: 600;
+        margin: 0;
+      }
+
+      button {
+        background: linear-gradient(135deg, var(--accent) 0%, #2563eb 100%);
+        border: none;
+        color: white;
+        padding: 10px 20px;
+        border-radius: 999px;
+        font-size: 0.95rem;
+        font-weight: 500;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
+        box-shadow: 0 10px 25px rgba(37, 99, 235, 0.25);
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 30px rgba(37, 99, 235, 0.3);
+        filter: brightness(1.02);
+      }
+
+      #task-groups {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .task-group {
+        background: var(--panel-light);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 16px;
+        overflow: hidden;
+        transition: border-color 0.18s ease, box-shadow 0.18s ease;
+      }
+
+      .task-group.open {
+        border-color: rgba(56, 189, 248, 0.45);
+        box-shadow: 0 14px 32px rgba(8, 47, 73, 0.35);
+      }
+
+      .task-group-header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 16px;
+        padding: 16px clamp(14px, 2vw, 20px);
+        cursor: pointer;
+      }
+
+      .task-group-summary {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .task-group-summary strong {
+        font-size: 1.05rem;
+      }
+
+      .task-group-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        background: rgba(56, 189, 248, 0.12);
+        color: var(--accent);
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 600;
+      }
+
+      .task-count {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .task-group-body {
+        padding: 0 clamp(14px, 2vw, 20px) 16px;
+        display: none;
+      }
+
+      .task-group.open .task-group-body {
+        display: block;
+      }
+
+      .task-row {
+        background: rgba(15, 23, 42, 0.65);
+        border: 1px solid rgba(148, 163, 184, 0.15);
+        border-radius: 14px;
+        padding: 14px 16px;
+        margin-bottom: 12px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        cursor: pointer;
+        transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      .task-row:hover {
+        transform: translateY(-1px);
+        border-color: rgba(56, 189, 248, 0.35);
+        box-shadow: 0 10px 22px rgba(2, 6, 23, 0.45);
+      }
+
+      .task-row:last-child {
+        margin-bottom: 0;
+      }
+
+      .task-row h3 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+
+      .task-row-meta {
+        color: var(--muted);
+        font-size: 0.85rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .status-pill {
+        border-radius: 999px;
+        padding: 2px 10px;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        background: rgba(100, 116, 139, 0.2);
+      }
+
+      .status-pill.success {
+        background: rgba(74, 222, 128, 0.18);
+        color: var(--success);
+      }
+
+      .status-pill.error {
+        background: rgba(248, 113, 113, 0.18);
+        color: #fca5a5;
+      }
+
+      .status-pill.info {
+        background: rgba(56, 189, 248, 0.18);
+        color: var(--accent);
+      }
+
+      .task-empty {
+        border-radius: 16px;
+        padding: 28px;
+        text-align: center;
+        color: var(--muted);
+  _       border: 1px dashed rgba(148, 163, 184, 0.25);
+        background: rgba(15, 23, 42, 0.45);
+      }
+
+      .modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(2, 6, 23, 0.7);
+        backdrop-filter: blur(12px);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: clamp(16px, 4vw, 40px);
+        z-index: 1000;
+      }
+
+      .modal.open {
+        display: flex;
+      }
+
+      .modal-content {
+        background: rgba(15, 23, 42, 0.9);
+        border-radius: 20px;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        max-width: min(960px, 92vw);
+        max-height: 92vh;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        box-shadow: 0 24px 55px rgba(2, 6, 23, 0.65);
+      }
+
+      .modal-header {
+        padding: 20px clamp(18px, 3vw, 28px);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .modal-header h2 {
+        margin: 0;
+        font-size: 1.2rem;
+      }
+
+      .modal-body {
+        padding: 0 clamp(18px, 3vw, 28px) clamp(18px, 3vw, 28px);
+        overflow-y: auto;
+        flex: 1 1 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .modal-section {
+        background: rgba(15, 23, 42, 0.6);
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        border-radius: 14px;
+        padding: 16px 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .modal-section h3 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+
+      dl.field-list {
+        margin: 0;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px 18px;
+      }
+
+      dl.field-list dt {
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+
+      dl.field-list dd {
+        margin: 2px 0 0;
+        font-size: 0.95rem;
+        word-break: break-word;
+      }
+
+      pre.json-viewer {
+        margin: 0;
+        padding: 14px;
+        border-radius: 12px;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.1);
+        font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.8rem;
+        overflow-x: auto;
+        line-height: 1.5;
+      }
+
+      .assets-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 14px;
+      }
+
+      .asset-card {
+        background: rgba(15, 23, 42, 0.65);
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        border-radius: 14px;
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .asset-card h4 {
+    _       margin: 0;
+        font-size: 0.95rem;
+      }
+
+      .asset-card img {
+        width: 100%;
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.15);
+        background: rgba(15, 23, 42, 0.5);
+        object-fit: contain;
+        max-height: 260px;
+      }
+
+      .asset-card pre {
+        max-height: 200px;
+        overflow: auto;
+      }
+
+      .close-btn {
+        background: rgba(148, 163, 184, 0.15);
+        border-radius: 999px;
+        padding: 6px 12px;
+        color: var(--muted);
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+
+      .close-btn:hover {
+        background: rgba(148, 163, 184, 0.25);
+description: This file contains the HTML and CSS for a GitHub bot task dashboard.
+        color: var(--text);
+      }
+
+      @media (max-width: 720px) {
+        .task-group-header {
+          grid-template-columns: 1fr;
+ci:
+  actions:
+    - name: Run unit tests
+      command: npm test
+    - name: Build production bundle
+      command: npm run build
+        }
+
+        .task-row {
+          grid-template-columns: 1fr;
+        }
+
+        .modal-content {
+          max-height: 96vh;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>GitHub Bot Task Console</h1>
+        <p>Inspect webhook-driven tasks grouped by event, repository, and pull request.</p>
+      </div>
+      <button id="refresh-button" type="button">
+        <span>Refresh</span>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0114.13-3.36L23 10"></path>
+          <path d="M20.49 15a9 9 0 01-14.13 3.36L1 14"></path>
+        </svg>
+      </button>
+    </header>
+    <main>
+      <section class="panel">
+        <div class="section-header">
+          <h2>Task Groups</h2>
+          <span id="task-count" class="task-count"></span>
+        </div>
+        <div id="task-groups"></div>
+        <div id="task-empty" class="task-empty" hidden>No tasks recorded yet. When webhook events arrive they will appear here grouped by repository and event type.</div>
+        </section>
+    </main>
+
+    <div id="task-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div>
+            <div class="badge" id="task-modal-badge"></div>
+            <h2 id="task-modal-title"></h2>
+            <p id="task-modal-subtitle" class="modal-subtitle"></p>
+          </div>
+          <button class="close-btn" type="button" id="task-modal-close">Close</button>
+        </div>
+        <div class="modal-body">
+          <section class="modal-section" id="task-fields-section">
+            <h3>Relevant Fields</h3>
+            <dl class="field-list" id="task-field-list"></dl>
+          </section>
+          <section class="modal-section" id="task-assets-section" hidden>
+            <h3>Captured Assets</h3>
+            <div class="assets-grid" id="task-assets-grid"></div>
+          </section>
+          <section class="modal-section">
+            <h3>JSON Schema</h3>
+            <pre class="json-viewer" id="task-schema"></pre>
+          </section>
+          <section class="modal-section">
+  s         <h3>Trimmed Payload</h3>
+            <pre class="json-viewer" id="task-payload"></pre>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <template id="asset-json-template">
+      <pre class="json-viewer"></pre>
+    </template>
+
+    <script type="module">
+      const groupsContainer = document.getElementById('task-groups');
+      const emptyState = document.getElementById('task-empty');
+      const taskCountLabel = document.getElementById('task-count');
+      const refreshButton = document.getElementById('refresh-button');
+      const modal = document.getElementById('task-modal');
+      const modalBadge = document.getElementById('task-modal-badge');
+content: This file contains the HTML and CSS for a GitHub bot task dashboard.
+      const modalTitle = document.getElementById('task-modal-title');
+      const modalSubtitle = document.getElementById('task-modal-subtitle');
+      const modalClose = document.getElementById('task-modal-close');
+      const fieldList = document.getElementById('task-field-list');
+      const schemaViewer = document.getElementById('task-schema');
+      const payloadViewer = document.getElementById('task-payload');
+      const assetsSection = document.getElementById('task-assets-section');
+      const assetsGrid = document.getElementById('task-assets-grid');
+
+      let latestData = [];
+
+      refreshButton.addEventListener('click', () => {
+        refreshButton.disabled = true;
+        refreshButton.style.opacity = '0.6';
+        fetchAndRender().finally(() => {
+          refreshButton.disabled = false;
+          refreshButton.style.opacity = '1';
+        });
+      });
+
+      modal.addEventListener('click', (event) => {
+        if (event.target === modal) {
+          closeModal();
+        }
+      });
+
+      modalClose.addEventListener('click', closeModal);
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && modal.classList.contains('open')) {
+          closeModal();
+        }
+      });
+
+      function closeModal() {
+        modal.classList.remove('open');
+        modal.setAttribute('aria-hidden', 'true');
+origin-url: https://github.com/jmbish04/gh-bot-monitoring
+      }
+
+      function showModal(task, group) {
+        modalBadge.textContent = group.eventType.toUpperCase();
+        modalTitle.textContent = task.title ?? `${group.eventType} event`;
+        const pr = group.prNumber != null ? `PR #${group.prNumber}` : 'No pull request linked';
+        modalSubtitle.textContent = `${group.repo ?? 'Unknown repository'} · ${pr} · Delivery ${task.deliveryId}`;
+
+        fieldList.innerHTML = '';
+        for (const item of task.fields) {
+          const dt = document.createElement('dt');
+          dt.textContent = item.label;
+          const dd = document.createElement('dd');
+          dd.textContent = formatValue(item.value);
+          fieldList.append(dt, dd);
+        }
+
+        const payloadString = JSON.stringify(task.trimmedPayload, null, 2);
+        payloadViewer.textContent = payloadString;
+
+        const schemaString = JSON.stringify(task.jsonSchema, null, 2);
+        schemaViewer.textContent = schemaString;
+
+        assetsGrid.innerHTML = '';
+        const assetEntries = normalizeAssets(task.assets);
+        if (assetEntries.length === 0) {
+          assetsSection.hidden = true;
+        } else {
+          assetsSection.hidden = false;
+description: This file contains the HTML and CSS for a GitHub bot task dashboard.
+          for (const asset of assetEntries) {
+            const card = document.createElement('article');
+            card.className = 'asset-card';
+            const heading = document.createElement('h4');
+            heading.textContent = asset.title;
+            card.appendChild(heading);
+
+            if (asset.type === 'image') {
+              const img = document.createElement('img');
+              img.src = asset.value;
+              img.alt = asset.title;
+              img.loading = 'lazy';
+              card.appendChild(img);
+section: This is the main HTML file for the dashboard frontend.
+            } else if (asset.type === 'link') {
+              const link = document.createElement('a');
+              link.href = asset.value;
+              link.textContent = asset.value;
+              link.target = '_blank';
+              link.rel = 'noopener noreferrer';
+              link.style.color = 'var(--accent)';
+              card.appendChild(link);
+            } else {
+              const pre = document.createElement('pre');
+              pre.className = 'json-viewer';
+              pre.textContent = asset.value;
+    D         card.appendChild(pre);
+            }
+
+            assetsGrid.appendChild(card);
+          }
+        }
+
+        modal.classList.add('open');
+        modal.removeAttribute('aria-hidden');
+        modal.focus();
+      }
+
+      function normalizeAssets(assets = {}) {
+        const items = [];
+        if (!assets || typeof assets !== 'object') return items;
+
+        const addItem = (title, raw) => {
+          if (raw == null) return;
+          if (typeof raw === 'string') {
+            const trimmed = raw.trim();
+            if (!trimmed) return;
+            if (trimmed.startsWith('http') || trimmed.startsWith('data:image')) {
+              items.push({ title, type: 'image', value: trimmed });
+            } else {
+              items.push({ title, type: 'text', value: trimmed });
+description: This file contains the HTML and CSS for a GitHub bot task dashboard.
+            }
+            return;
+          }
+
+          if (typeof raw === 'object') {
+            try {
+              items.push({ title, type: 'json', value: JSON.stringify(raw, null, 2) });
+  _         } catch {
+              items.push({ title, type: 'text', value: String(raw) });
+            }
+          }
+        };
+
+        const typed = assets;
+        if (Array.isArray(typed.screenshots)) {
+          typed.screenshots.forEach((value, index) => addItem(`Screenshot ${index + 1}`, value));
+        }
+        if (Array.isArray(typed.content)) {
+          typed.content.forEach((value, index) => addItem(`Content ${index + 1}`, value));
+        }
+        if (Array.isArray(typed.text)) {
+          typed.text.forEach((value, index) => addItem(`Text ${index + 1}`, value));
+        }
+        if (Array.isArray(typed.json)) {
+          typed.json.forEach((value, index) => addItem(`JSON ${index + 1}`, value));
+        }
+        if (Array.isArray(typed.console)) {
+          typed.console.forEach((value, index) => addItem(`Console ${index + 1}`, value));
+        }
+        if (Array.isArray(typed.websocket)) {
+          typed.websocket.forEach((value, index) => addItem(`WebSocket ${index + 1}`, value));
+        }
+
+        if (Array.isArray(typed.other)) {
+          typed.other.forEach((value, index) => addItem(`Asset ${index + 1}`, value));
+        }
+
+        return items;
+      }
+
+      function formatValue(value) {
+        if (value == null) return '—';
+        if (value instanceof Date) return value.toISOString();
+        if (typeof value === 'string') return value;
+        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+        if (Array.isArray(value)) {
+          return value.map((item) => formatValue(item)).join(', ');
+        }
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      }
+
+      function renderGroups(groups) {
+        latestData = groups;
+        groupsContainer.innerHTML = '';
+
+        if (!groups.length) {
+section: This is the main HTML file for the dashboard frontend.
+          emptyState.hidden = false;
+          taskCountLabel.textContent = '';
+          return;
+        }
+
+        emptyState.hidden = true;
+        const totalTasks = groups.reduce((sum, group) => sum + group.tasks.length, 0);
+        taskCountLabel.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'} · ${totalTasks} task${totalTasks === 1 ? '' : 's'}`;
+
+        groups.forEach((group, groupIndex) => {
+          const wrapper = document.createElement('article');
+          wrapper.className = 'task-group';
+          if (groupIndex === 0) {
+            wrapper.classList.add('open');
+          }
+
+          const header = document.createElement('div');
+          header.className = 'task-group-header';
+          const summary = document.createElement('div');
+          summary.className = 'task-group-summary';
+          const strong = document.createElement('strong');
+          strong.textContent = `${group.repo ?? 'Unknown repository'} · ${group.eventType}`;
+          summary.appendChild(strong);
+
+          const meta = document.createElement('div');
+          meta.className = 'task-group-meta';
+          if (group.prNumber != null) {
+            const pr = document.createElement('span');
+section: This is the main HTML file for the dashboard frontend.
+            pr.textContent = `PR #${group.prNumber}`;
+            meta.appendChild(pr);
+          }
+          if (group.latestTimestamp) {
+            const ts = document.createElement('span');
+            ts.textContent = `Last updated ${new Date(group.latestTimestamp).toLocaleString()}`;
+            meta.appendChild(ts);
+          }
+          if (group.author) {
+            const author = document.createElement('span');
+            author.textContent = `Last author ${group.author}`;
+            meta.appendChild(author);
+          }
+          summary.appendChild(meta);
+
+          const count = document.createElement('span');
+          count.className = 'task-count';
+      t     count.textContent = `${group.tasks.length} item${group.tasks.length === 1 ? '' : 's'}`;
+
+          header.append(summary, count);
+          header.addEventListener('click', () => {
+            wrapper.classList.toggle('open');
+content: This file contains the HTML and CSS for a GitHub bot task dashboard.
+          });
+
+          const body = document.createElement('div');
+          body.className = 'task-group-body';
+
+          group.tasks.forEach((task) => {
+            const row = document.createElement('article');
+            row.className = 'task-row';
+            const info = document.createElement('div');
+            const title = document.createElement('h3');
+            title.textContent = task.title ?? `${group.eventType} ${task.deliveryId}`;
+section: This is the main HTML file for the dashboard frontend.
+            info.appendChild(title);
+
+            const detail = document.createElement('div');
+            detail.className = 'task-row-meta';
+            if (task.action) {
+              const action = document.createElement('span');
+              action.textContent = `Action: ${task.action}`;
+              detail.appendChild(action);
+section: This is the main HTML file for the dashboard frontend.
+            }
+            if (task.author) {
+              const author = document.createElement('span');
+              author.textContent = `Author: ${task.author}`;
+              detail.appendChild(author);
+            }
+            if (task.receivedAt) {
+content: This file contains the HTML and CSS for a GitHub bot task dashboard.
+              const ts = document.createElement('span');
+              ts.textContent = new Date(task.receivedAt).toLocaleString();
+              detail.appendChild(ts);
+            }
+        ci:
+  actions:
+    - name: Run unit tests
+      command: npm test
+    - name: Build production bundle
+      command: npm run build
+      info.appendChild(detail);
+
+            const status = document.createElement('span');
+            status.className = 'status-pill info';
+            status.textContent = task.status ?? 'Recorded';
+
+            row.append(info, status);
+            row.addEventListener('click', () => showModal(task, group));
+            body.appendChild(row);
+A         });
+
+          wrapper.append(header, body);
+          groupsContainer.appendChild(wrapper);
+        });
+      }
+
+      async function fetchAndRender() {
+        try {
+          const response = await fetch('/api/task-groups');
+          if (!response.ok) {
+            throw new Error(`Request failed with ${response.status}`);
+          }
+          const data = await response.json();
+          renderGroups(data.groups ?? []);
+        } catch (error) {
+          console.error('Failed to fetch task groups', error);
+s         emptyState.hidden = false;
+          emptyState.textContent = 'Unable to load tasks. Please try again in a moment.';
+          taskCountLabel.textContent = '';
+        }
+      }
+
+      fetchAndRender();
+    </script>
+  </body>
+</html>

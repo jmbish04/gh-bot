@@ -1,0 +1,17 @@
+export { RestClient } from './core/client';
+export * as core from './core';
+export * as repos from './repos/repos';
+export * as trees from './repos/trees';
+export * as blobs from './repos/blobs';
+export * as branches from './repos/branches';
+export * as commits from './repos/commits';
+export * as contents from './repos/contents';
+export * as pulls from './pulls/pulls';
+export * as issues from './issues/issues';
+export * as search from './search/search';
+export * as users from './users/users';
+export * as orgs from './orgs/orgs';
+export * as actions from './actions/workflows';
+export * as apps from './apps/apps';
+export * as appTypes from './apps/types';
+export * as webhooks from './webhooks/webhooks';
